@@ -1,0 +1,785 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>APIverse - Bridging Intent to APIs</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #0f0f23, #1a1a3a, #2d1b69);
+            color: white;
+            overflow: hidden;
+        }
+
+        .presentation-container {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .slide {
+            display: none;
+            width: 90%;
+            max-width: 1200px;
+            text-align: center;
+            animation: slideIn 0.6s ease-out;
+        }
+
+        .slide.active {
+            display: block;
+        }
+
+        @keyframes slideIn {
+            from { opacity: 0; transform: translateY(30px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .slide h1 {
+            font-size: 3.5rem;
+            margin-bottom: 2rem;
+            background: linear-gradient(45deg, #64ffda, #00bcd4, #2196f3);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .slide h2 {
+            font-size: 2.5rem;
+            margin-bottom: 1.5rem;
+            color: #64ffda;
+        }
+
+        .slide h3 {
+            font-size: 2rem;
+            margin-bottom: 1rem;
+            color: #81c784;
+        }
+
+        .slide p, .slide li {
+            font-size: 1.4rem;
+            line-height: 1.6;
+            margin-bottom: 1rem;
+            color: #e0e0e0;
+        }
+
+        .highlight {
+            color: #ffd54f;
+            font-weight: bold;
+        }
+
+        .problem-visual {
+            display: flex;
+            justify-content: space-around;
+            margin: 2rem 0;
+            flex-wrap: wrap;
+        }
+
+        .api-box {
+            background: rgba(255, 255, 255, 0.1);
+            border: 2px solid #ff5722;
+            border-radius: 10px;
+            padding: 1rem;
+            margin: 0.5rem;
+            width: 150px;
+            height: 100px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            animation: shake 2s infinite;
+        }
+
+        @keyframes shake {
+            0%, 100% { transform: translateX(0); }
+            25% { transform: translateX(-5px); }
+            75% { transform: translateX(5px); }
+        }
+
+        .solution-visual {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 2rem 0;
+        }
+
+        .apiverse-hub {
+            background: linear-gradient(45deg, #64ffda, #00bcd4);
+            border-radius: 50%;
+            width: 200px;
+            height: 200px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.5rem;
+            font-weight: bold;
+            color: #0f0f23;
+            animation: pulse 2s infinite;
+            position: relative;
+        }
+
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.1); }
+        }
+
+        .connected-api {
+            background: rgba(129, 199, 132, 0.8);
+            border-radius: 10px;
+            padding: 0.8rem;
+            margin: 0 1rem;
+            width: 120px;
+            height: 80px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.9rem;
+            animation: glow 2s infinite alternate;
+        }
+
+        @keyframes glow {
+            from { box-shadow: 0 0 10px rgba(129, 199, 132, 0.5); }
+            to { box-shadow: 0 0 20px rgba(129, 199, 132, 0.8); }
+        }
+
+        .demo-interface {
+            background: rgba(0, 0, 0, 0.7);
+            border: 2px solid #64ffda;
+            border-radius: 15px;
+            padding: 2rem;
+            margin: 2rem 0;
+            max-width: 800px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+
+        .demo-input {
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid #64ffda;
+            border-radius: 8px;
+            padding: 1rem;
+            font-size: 1.2rem;
+            width: 100%;
+            color: white;
+            margin-bottom: 1rem;
+        }
+
+        .demo-output {
+            background: rgba(76, 175, 80, 0.2);
+            border-left: 4px solid #4caf50;
+            padding: 1.5rem;
+            margin-top: 1rem;
+            text-align: left;
+            border-radius: 5px;
+        }
+
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1.5rem;
+            margin: 2rem 0;
+        }
+
+        .metric-card {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 15px;
+            padding: 1.5rem;
+            border: 2px solid transparent;
+            background-clip: padding-box;
+            transition: transform 0.3s ease;
+        }
+
+        .metric-card:hover {
+            transform: translateY(-10px);
+            background: rgba(255, 255, 255, 0.15);
+        }
+
+        .metric-number {
+            font-size: 3rem;
+            font-weight: bold;
+            color: #64ffda;
+            display: block;
+        }
+
+        .vision-timeline {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin: 2rem 0;
+            flex-wrap: wrap;
+        }
+
+        .timeline-step {
+            background: linear-gradient(45deg, #673ab7, #9c27b0);
+            border-radius: 15px;
+            padding: 1.5rem;
+            margin: 0.5rem;
+            flex: 1;
+            min-width: 200px;
+            position: relative;
+        }
+
+        .timeline-step::after {
+            content: '→';
+            position: absolute;
+            right: -20px;
+            top: 50%;
+            transform: translateY(-50%);
+            font-size: 2rem;
+            color: #64ffda;
+        }
+
+        .timeline-step:last-child::after {
+            display: none;
+        }
+
+        .navigation {
+            position: fixed;
+            bottom: 30px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 1rem;
+        }
+
+        .nav-btn {
+            background: rgba(255, 255, 255, 0.2);
+            border: 2px solid #64ffda;
+            color: white;
+            padding: 0.8rem 1.5rem;
+            border-radius: 25px;
+            cursor: pointer;
+            font-size: 1rem;
+            transition: all 0.3s ease;
+        }
+
+        .nav-btn:hover {
+            background: #64ffda;
+            color: #0f0f23;
+            transform: scale(1.05);
+        }
+
+        .slide-counter {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 0.5rem 1rem;
+            border-radius: 20px;
+            font-size: 1rem;
+        }
+
+        .stars {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: -1;
+        }
+
+        .star {
+            position: absolute;
+            background: white;
+            border-radius: 50%;
+            animation: twinkle 3s infinite;
+        }
+
+        @keyframes twinkle {
+            0%, 100% { opacity: 0.3; }
+            50% { opacity: 1; }
+        }
+
+        .cta-button {
+            background: linear-gradient(45deg, #ff6b6b, #ff8e53);
+            border: none;
+            color: white;
+            padding: 1rem 2rem;
+            font-size: 1.3rem;
+            border-radius: 25px;
+            cursor: pointer;
+            margin: 1rem;
+            transition: transform 0.3s ease;
+        }
+
+        .cta-button:hover {
+            transform: scale(1.1);
+        }
+
+        .logo {
+            font-size: 4rem;
+            background: linear-gradient(45deg, #64ffda, #00bcd4, #2196f3, #673ab7);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            font-weight: bold;
+            margin-bottom: 1rem;
+        }
+
+        ul {
+            text-align: left;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+
+        li {
+            margin-bottom: 1rem;
+            padding-left: 1rem;
+            position: relative;
+        }
+
+        li::before {
+            content: '🌟';
+            position: absolute;
+            left: -1rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="stars" id="stars"></div>
+    
+    <div class="slide-counter">
+        <span id="currentSlide">1</span> / <span id="totalSlides">12</span>
+    </div>
+
+    <div class="presentation-container">
+        <!-- Slide 1: Opening Hook -->
+        <div class="slide active">
+            <div class="logo">APIverse</div>
+            <h1>Bridging Human Intent to APIs</h1>
+            <p style="font-size: 1.4rem; margin-bottom: 2rem; color: #e0e0e0;">Unlock Data and Derive Business Intelligence</p>
+            
+            <div style="background: rgba(255, 255, 255, 0.1); border-radius: 20px; padding: 2rem; margin: 2rem 0; border: 2px solid #64ffda;">
+                <p style="font-size: 1.8rem; margin-bottom: 1.5rem; color: #ffd54f;">It's 11 PM Friday. Your biggest client is panicking...</p>
+                <div style="background: rgba(0, 0, 0, 0.5); padding: 1.5rem; border-radius: 10px; margin: 1rem 0;">
+                    <p style="font-size: 1.6rem; color: #64ffda; font-style: italic;">"Is Project Apollo at risk? Show me team availability and who can cover if needed."</p>
+                </div>
+                <p style="font-size: 1.8rem; margin-top: 1.5rem;">...could orchestrate 5 APIs and deliver a complete crisis management plan...</p>
+                <p style="font-size: 2.5rem; color: #4caf50; margin-top: 1rem;"><strong>...in just 3 seconds?</strong></p>
+            </div>
+            
+            <div style="margin-top: 2rem;">
+                <p style="font-size: 1.4rem; color: #81c784;">We just built exactly that.</p>
+                <p style="font-size: 1.6rem; color: #64ffda; margin-top: 1rem;"><strong>Welcome to the universal bridge between human intent and infinite business intelligence.</strong></p>
+            </div>
+            
+            <div style="display: flex; justify-content: center; align-items: center; margin-top: 3rem; gap: 2rem;">
+                <div style="background: rgba(255, 87, 34, 0.3); border: 2px solid #ff5722; border-radius: 15px; padding: 1rem; animation: shake 3s infinite;">
+                    <p style="font-size: 1rem; margin: 0;">Traditional</p>
+                    <p style="font-size: 1.4rem; color: #ff5722; margin: 0;"><strong>Weekend Crisis</strong></p>
+                </div>
+                <div style="font-size: 3rem; color: #ffd54f;">⚡</div>
+                <div style="background: rgba(76, 175, 80, 0.3); border: 2px solid #4caf50; border-radius: 15px; padding: 1rem; animation: glow 2s infinite alternate;">
+                    <p style="font-size: 1rem; margin: 0;">APIverse</p>
+                    <p style="font-size: 1.4rem; color: #4caf50; margin: 0;"><strong>3-Second Solution</strong></p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 2: The Crisis Scenario -->
+        <div class="slide">
+            <h2>🚨 Friday 11 PM: The $2M Crisis</h2>
+            <div style="background: rgba(255, 255, 255, 0.1); border-radius: 15px; padding: 2rem; margin: 2rem 0;">
+                <p style="font-size: 1.8rem; color: #ffd54f; margin-bottom: 2rem;">"Sarah, our biggest client is panicking. Project Apollo launches Monday. The tech lead isn't answering. Can we deliver?"</p>
+                <div style="display: flex; justify-content: center; align-items: center; margin: 2rem 0;">
+                    <div style="background: rgba(255, 87, 34, 0.3); border: 2px solid #ff5722; border-radius: 10px; padding: 1rem; margin: 0 1rem;">
+                        <p style="font-size: 1.2rem;">VP Engineering</p>
+                        <p style="color: #ff5722;">😰 Panicking</p>
+                        <p style="font-size: 0.9rem;">Needs answers NOW</p>
+                    </div>
+                    <div style="font-size: 3rem; color: #ff5722;">❓</div>
+                    <div style="background: rgba(255, 87, 34, 0.3); border: 2px solid #ff5722; border-radius: 10px; padding: 1rem; margin: 0 1rem;">
+                        <p style="font-size: 1.2rem;">Critical Questions</p>
+                        <p style="color: #ff5722;">❌ No Answers</p>
+                        <p style="font-size: 0.9rem;">Data locked in silos</p>
+                    </div>
+                </div>
+                <div style="background: rgba(0, 0, 0, 0.3); padding: 1.5rem; border-radius: 10px; border-left: 4px solid #ff5722;">
+                    <p style="color: #ff5722; font-weight: bold;">Critical Questions:</p>
+                    <ul style="text-align: left; margin-top: 1rem;">
+                        <li>Who's actually working on Project Apollo?</li>
+                        <li>Is anyone on the core team on vacation?</li>
+                        <li>Who has the skills to jump in if needed?</li>
+                        <li>What's the real project status?</li>
+                    </ul>
+                </div>
+                <p style="font-size: 1.4rem; color: #ff5722; margin-top: 1.5rem;"><strong>Traditional Reality: Entire weekend spent calling people and checking systems</strong></p>
+            </div>
+        </div>
+
+        <!-- Slide 3: The API Spaghetti Problem -->
+        <div class="slide">
+            <h2>🍝 The API Spaghetti Problem</h2>
+            <div class="metrics-grid" style="grid-template-columns: 1fr 1fr;">
+                <div class="metric-card" style="border: 2px solid #ff5722;">
+                    <h3>🏗️ Hardcoded Chaos</h3>
+                    <p>Adding new APIs = rewriting everything</p>
+                </div>
+                <div class="metric-card" style="border: 2px solid #ff5722;">
+                    <h3>🤷 Poor UX</h3>
+                    <p>Users need to know which APIs to call</p>
+                </div>
+                <div class="metric-card" style="border: 2px solid #ff5722;">
+                    <h3>⚡ Scaling Impossible</h3>
+                    <p>Each API creates exponential complexity</p>
+                </div>
+                <div class="metric-card" style="border: 2px solid #ff5722;">
+                    <h3>😭 Developer Pain</h3>
+                    <p>60% time on orchestration, not features</p>
+                </div>
+            </div>
+            <div class="demo-interface" style="border-color: #ff5722;">
+                <h3>Real Pain Point:</h3>
+                <p style="color: #ffd54f; font-size: 1.3rem;">"Who is the account owner of project 111811 and are they on leave?"</p>
+                <div style="text-align: left; margin-top: 1rem;">
+                    <p>1. Call Seal API → get project details</p>
+                    <p>2. Extract account_owner_id</p>
+                    <p>3. Call Employee API → get employee</p>
+                    <p>4. Call Leaves API → check vacation</p>
+                    <p>5. Manually join responses</p>
+                    <p>6. Handle errors at each step</p>
+                </div>
+                <p style="color: #ff5722; margin-top: 1rem;"><strong>Result: 200 lines of code, 2-3 weeks</strong></p>
+            </div>
+        </div>
+
+        <!-- Slide 4: Intelligent API Router Solution -->
+        <div class="slide">
+            <h2>💡 Intelligent API Router</h2>
+            <div class="vision-timeline">
+                <div class="timeline-step" style="background: linear-gradient(45deg, #4caf50, #81c784);">
+                    <h3>🎯 Intent Classification</h3>
+                    <p>LLM understands natural language</p>
+                </div>
+                <div class="timeline-step" style="background: linear-gradient(45deg, #2196f3, #64b5f6);">
+                    <h3>🔍 API Discovery</h3>
+                    <p>Discovers relevant APIs and maps flow</p>
+                </div>
+                <div class="timeline-step" style="background: linear-gradient(45deg, #ff9800, #ffb74d);">
+                    <h3>🚀 Smart Execution</h3>
+                    <p>Parallel calls + auto joining</p>
+                </div>
+                <div class="timeline-step" style="background: linear-gradient(45deg, #9c27b0, #ba68c8);">
+                    <h3>✨ Rich Response</h3>
+                    <p>Human-readable answers</p>
+                </div>
+            </div>
+            <div class="demo-interface">
+                <h3>🔥 NEW: Zero-Config Magic</h3>
+                <input type="text" class="demo-input" value='router.auto_discover_api("https://hr.company.com/api/swagger.json")' readonly>
+                <div class="demo-output">
+                    <p>✨ LLM Analysis Result:</p>
+                    <p>🎯 Discovered 15 endpoints</p>
+                    <p>🔗 Mapped 8 relationships</p>
+                    <p>📝 Generated 12 new intents</p>
+                    <p>⚡ Ready for natural language queries!</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 5: Live Demo - Swagger AI Magic -->
+        <div class="slide">
+            <h2>🤖 Swagger AI Parser Demo</h2>
+            <div class="demo-interface" style="background: rgba(76, 175, 80, 0.1); border-color: #4caf50;">
+                <h3>Step 1: Point to any Swagger URL</h3>
+                <input type="text" class="demo-input" value="https://hr.company.com/api/swagger.json" readonly>
+                <div style="margin: 1rem 0; color: #81c784;">
+                    <p>🧠 LLM reading OpenAPI spec...</p>
+                    <p>🔍 Understanding business logic...</p>
+                    <p>🔗 Mapping relationships...</p>
+                </div>
+                <div class="demo-output" style="background: rgba(76, 175, 80, 0.3);">
+                    <p><strong>📊 Auto-Generated Configuration:</strong></p>
+                    <p>• Employee API: 5 endpoints discovered</p>
+                    <p>• Relationships: manager_id → employee_id</p>
+                    <p>• Intents: employee_info, vacation_status, management_chain</p>
+                    <p>• Natural mappings: "Is John on vacation?" → vacation check flow</p>
+                </div>
+            </div>
+            <p style="font-size: 1.6rem; color: #4caf50; margin-top: 1rem;">
+                <strong>30 seconds: Swagger → Queryable API</strong>
+            </p>
+        </div>
+
+        <!-- Slide 6: Live Demo - The Crisis Solved -->
+        <div class="slide">
+            <h2>🎬 APIverse: Crisis to Solution in 3 Seconds</h2>
+            <div class="demo-interface">
+                <h3>Sarah's Emergency Query:</h3>
+                <input type="text" class="demo-input" value="Is Project Apollo at risk? Show me team availability and who can cover if needed." readonly>
+                <div class="demo-output">
+                    <p><strong>🔍 API Discovery:</strong> SEAL → HR → Leave APIs</p>
+                    <p><strong>🚀 Smart Execution:</strong> Parallel calls + intelligent joining</p>
+                    <br>
+                    <div style="background: rgba(255, 87, 34, 0.2); padding: 1rem; border-radius: 8px; border-left: 4px solid #ff5722;">
+                        <p style="color: #ff5722;"><strong>🚨 PROJECT APOLLO - HIGH RISK ALERT</strong></p>
+                        <p><strong>📊 Team Status:</strong> 5 developers, 1 QA, 1 tech lead</p>
+                        <p><strong>⚠️ Available Weekend:</strong> Only 3 people (2 on vacation, tech lead MIA)</p>
+                    </div>
+                    <div style="background: rgba(76, 175, 80, 0.2); padding: 1rem; border-radius: 8px; border-left: 4px solid #4caf50; margin-top: 1rem;">
+                        <p style="color: #4caf50;"><strong>💡 Recommended Actions:</strong></p>
+                        <p>• Contact Lisa Park (has Apollo experience, available)</p>
+                        <p>• Jake Wilson from Team Beta (similar tech stack)</p>
+                        <p>• Consider 48-hour delay vs quality risk</p>
+                        <p><strong>📞 Emergency Contacts:</strong> Lisa (555) 123-4567, Jake (555) 987-6543</p>
+                    </div>
+                </div>
+            </div>
+            <p style="font-size: 1.8rem; color: #4caf50; margin-top: 2rem;">
+                <strong>Weekend Crisis → Manageable Action Plan in 3 Seconds</strong>
+            </p>
+        </div>
+
+        <!-- Slide 7: Demo 2 - Real Magic -->
+        <div class="slide">
+            <h2>The Real Magic - Dynamic API Discovery</h2>
+            <div class="demo-interface">
+                <h3>Adding New API Universe Live:</h3>
+                <input type="text" class="demo-input" value="https://api.company.com/hr/swagger.json" readonly>
+                <p style="color: #81c784; margin: 1rem 0;">🔄 APIverse mapping new territory... 30 seconds</p>
+                
+                <h3>Instant Query on New API:</h3>
+                <input type="text" class="demo-input" value="Which employees in Engineering have upcoming performance reviews?" readonly>
+                <div class="demo-output">
+                    <p><strong>🎯 Instant Results:</strong></p>
+                    <p>• Sarah Chen - Review scheduled March 15th</p>
+                    <p>• Mike Rodriguez - Review due March 20th</p>
+                    <p>• Lisa Park - Overdue by 5 days</p>
+                </div>
+            </div>
+            <p style="font-size: 1.8rem; color: #64ffda; margin-top: 2rem;">
+                <strong>Traditional Integration: 3 weeks → APIverse: 30 seconds</strong>
+            </p>
+        </div>
+
+        <!-- Slide 8: Business Intelligence Unlocked -->
+        <div class="slide">
+            <h2>🧠 Unlocking Business Intelligence</h2>
+            <div style="background: rgba(255, 255, 255, 0.1); border-radius: 15px; padding: 2rem; margin: 2rem 0;">
+                <h3 style="color: #64ffda; margin-bottom: 1.5rem;">From Data Silos to Instant Intelligence</h3>
+                <div style="display: flex; justify-content: space-between; margin: 2rem 0;">
+                    <div style="flex: 1; text-align: center;">
+                        <p style="color: #ff5722; font-size: 1.2rem;"><strong>Before: Data Imprisoned</strong></p>
+                        <div style="background: rgba(255, 87, 34, 0.2); padding: 1rem; border-radius: 10px; margin: 1rem;">
+                            <p>📊 SEAL API</p>
+                            <p>👥 HR API</p>
+                            <p>🏖️ Leave API</p>
+                            <p style="font-size: 0.9rem; color: #ff5722;">Isolated • Manual • Slow</p>
+                        </div>
+                    </div>
+                    <div style="font-size: 3rem; color: #ffd54f; align-self: center;">⚡</div>
+                    <div style="flex: 1; text-align: center;">
+                        <p style="color: #4caf50; font-size: 1.2rem;"><strong>After: Intelligence Unlocked</strong></p>
+                        <div style="background: rgba(76, 175, 80, 0.2); padding: 1rem; border-radius: 10px; margin: 1rem;">
+                            <p>🧠 Unified Intelligence</p>
+                            <p>📈 Predictive Insights</p>
+                            <p>🚨 Risk Detection</p>
+                            <p style="font-size: 0.9rem; color: #4caf50;">Connected • Automatic • Instant</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="metrics-grid">
+                <div class="metric-card">
+                    <span class="metric-number">90%</span>
+                    <p>Less Code</p>
+                    <small>200+ lines → Simple question</small>
+                </div>
+                <div class="metric-card">
+                    <span class="metric-number">30sec</span>
+                    <p>API Integration</p>
+                    <small>Swagger URL → Ready to query</small>
+                </div>
+                <div class="metric-card">
+                    <span class="metric-number">∞</span>
+                    <p>Scalability</p>
+                    <small>Any API, any question</small>
+                </div>
+                <div class="metric-card">
+                    <span class="metric-number">100%</span>
+                    <p>Intelligence Access</p>
+                    <small>Every employee becomes analyst</small>
+                </div>
+            </div>
+            
+            <p style="font-size: 1.8rem; text-align: center; margin-top: 2rem; color: #64ffda;">
+                <strong>We don't just connect APIs - we unlock human potential through intelligent data access</strong>
+            </p>
+        </div>
+
+        <!-- Slide 9: Technical Innovation -->
+        <div class="slide">
+            <h2>🧠 Technical Innovation Breakthrough</h2>
+            <div class="metrics-grid">
+                <div class="metric-card">
+                    <h3>🤖 LLM Integration</h3>
+                    <p>Works with any LLM API (OpenAI, Claude, local models)</p>
+                    <p style="font-size: 0.9rem; color: #81c784;">Intelligent intent classification & parameter extraction</p>
+                </div>
+                <div class="metric-card">
+                    <h3>📄 Swagger AI Parser</h3>
+                    <p>LLM reads OpenAPI specs automatically</p>
+                    <p style="font-size: 0.9rem; color: #81c784;">Understands parameters, relationships, business logic</p>
+                </div>
+                <div class="metric-card">
+                    <h3>📊 Dependency Resolution</h3>
+                    <p>Automatic execution planning with parallel processing</p>
+                    <p style="font-size: 0.9rem; color: #81c784;">Smart join strategies between APIs</p>
+                </div>
+                <div class="metric-card">
+                    <h3>🔌 Zero-Config Integration</h3>
+                    <p>Point to any Swagger URL and start querying</p>
+                    <p style="font-size: 0.9rem; color: #81c784;">No manual configuration required!</p>
+                </div>
+            </div>
+            
+            <div class="demo-interface" style="margin-top: 2rem; background: rgba(156, 39, 176, 0.2); border-color: #9c27b0;">
+                <h3>🚀 Swagger Enhancement Pipeline</h3>
+                <div class="vision-timeline" style="justify-content: space-around;">
+                    <div class="timeline-step" style="background: linear-gradient(45deg, #2196f3, #64b5f6); padding: 1rem; margin: 0;">
+                        <h4>📄 Parse</h4>
+                        <p style="font-size: 0.9rem;">Extract endpoints & schemas</p>
+                    </div>
+                    <div class="timeline-step" style="background: linear-gradient(45deg, #4caf50, #81c784); padding: 1rem; margin: 0;">
+                        <h4>🤖 Analyze</h4>
+                        <p style="font-size: 0.9rem;">LLM understands logic</p>
+                    </div>
+                    <div class="timeline-step" style="background: linear-gradient(45deg, #ff9800, #ffb74d); padding: 1rem; margin: 0;">
+                        <h4>🔗 Configure</h4>
+                        <p style="font-size: 0.9rem;">Generate intents & rules</p>
+                    </div>
+                    <div class="timeline-step" style="background: linear-gradient(45deg, #9c27b0, #ba68c8); padding: 1rem; margin: 0;">
+                        <h4>✨ Query</h4>
+                        <p style="font-size: 0.9rem;">Natural language ready</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 8: The Vision -->
+        <div class="slide">
+            <h2>The Future We're Building</h2>
+            <div class="vision-timeline">
+                <div class="timeline-step">
+                    <h3>Today</h3>
+                    <p>Universal API translator</p>
+                </div>
+                <div class="timeline-step">
+                    <h3>Next</h3>
+                    <p>APIverse Operating System</p>
+                </div>
+                <div class="timeline-step">
+                    <h3>Future</h3>
+                    <p>Data-driven civilizations</p>
+                </div>
+            </div>
+            <p style="font-size: 1.6rem; margin-top: 2rem;">Every business question instantly connects to <span class="highlight">infinite business intelligence</span></p>
+            <p style="font-size: 1.4rem; margin-top: 1rem;">Where every company becomes a data-driven civilization exploring their own universe of insights</p>
+        </div>
+
+        <!-- Slide 9: The Ask & Close -->
+        <div class="slide">
+            <h2>Join the APIverse Revolution</h2>
+            <div class="metrics-grid" style="grid-template-columns: 1fr 1fr 1fr;">
+                <div class="metric-card">
+                    <h3>💰 Investment</h3>
+                    <p>Scale universal platform worldwide</p>
+                </div>
+                <div class="metric-card">
+                    <h3>🤝 Partnerships</h3>
+                    <p>Connect with enterprise software vendors</p>
+                </div>
+                <div class="metric-card">
+                    <h3>👥 Talent</h3>
+                    <p>AI engineers & enterprise navigators</p>
+                </div>
+            </div>
+            
+            <div style="margin: 3rem 0;">
+                <p style="font-size: 1.8rem; margin-bottom: 1rem;">Three weeks ago: Armies of developers building custom bridges</p>
+                <p style="font-size: 2rem; color: #64ffda; margin-bottom: 1rem;"><strong>Today: 3-second universal translation</strong></p>
+                <p style="font-size: 1.6rem; color: #81c784;">We've just demonstrated the universal translator for the APIverse</p>
+            </div>
+            
+            <div class="logo" style="font-size: 3rem;">Welcome to APIverse</div>
+            <p style="font-size: 1.4rem; color: #64ffda;"><strong>The universe of connected data awaits</strong></p>
+            
+            <button class="cta-button" onclick="window.location.reload()">Start Over</button>
+        </div>
+    </div>
+
+    <div class="navigation">
+        <button class="nav-btn" onclick="previousSlide()">← Previous</button>
+        <button class="nav-btn" onclick="nextSlide()">Next →</button>
+    </div>
+
+    <script>
+        let currentSlideIndex = 0;
+        const slides = document.querySelectorAll('.slide');
+        const totalSlides = slides.length;
+        
+        document.getElementById('totalSlides').textContent = totalSlides;
+
+        function showSlide(index) {
+            slides.forEach(slide => slide.classList.remove('active'));
+            slides[index].classList.add('active');
+            document.getElementById('currentSlide').textContent = index + 1;
+        }
+
+        function nextSlide() {
+            currentSlideIndex = (currentSlideIndex + 1) % totalSlides;
+            showSlide(currentSlideIndex);
+        }
+
+        function previousSlide() {
+            currentSlideIndex = (currentSlideIndex - 1 + totalSlides) % totalSlides;
+            showSlide(currentSlideIndex);
+        }
+
+        // Keyboard navigation
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'ArrowRight' || e.key === ' ') {
+                nextSlide();
+            } else if (e.key === 'ArrowLeft') {
+                previousSlide();
+            }
+        });
+
+        // Create animated stars background
+        function createStars() {
+            const starsContainer = document.getElementById('stars');
+            const numberOfStars = 100;
+            
+            for (let i = 0; i < numberOfStars; i++) {
+                const star = document.createElement('div');
+                star.className = 'star';
+                star.style.left = Math.random() * 100 + '%';
+                star.style.top = Math.random() * 100 + '%';
+                star.style.width = Math.random() * 3 + 1 + 'px';
+                star.style.height = star.style.width;
+                star.style.animationDelay = Math.random() * 3 + 's';
+                starsContainer.appendChild(star);
+            }
+        }
+
+        // Initialize
+        createStars();
+        showSlide(0);
+
+        // Auto-advance slides every 30 seconds (for demo purposes)
+        // Uncomment the next line if you want auto-advance
+        // setInterval(nextSlide, 30000);
+    </script>
+</body>
+</html>
