@@ -1,0 +1,110 @@
+graph TB
+    subgraph "Broadcast Creation"
+        U1[Admin User]
+        U2[System Event]
+        U3[API Client]
+        API[Broadcast API]
+    end
+    
+    subgraph "Routing Decision"
+        RD{Broadcast Type?}
+        JV[JIT Validator]
+        SA[Slot Assigner]
+    end
+    
+    subgraph "Storage"
+        MongoDB[(MongoDB<br/>Broadcasts)]
+        Redis[(Redis<br/>Rate Limits)]
+    end
+    
+    subgraph "Scheduled Path"
+        EB[EventBridge<br/>288 Rules]
+        SL[Slot Processor<br/>Lambda]
+        SQ1[SQS Standard<br/>Queue]
+    end
+    
+    subgraph "JIT Path"
+        JQ[SQS FIFO<br/>High Priority]
+        JL[JIT Processor<br/>Lambda]
+    end
+    
+    subgraph "Channel Distribution"
+        EventBus[EventBridge<br/>Event Bus]
+        ER[Email Rule]
+        SR[SMS Rule]
+        PR[Push Rule]
+        SLR[Slack Rule]
+    end
+    
+    subgraph "Channel Processors"
+        EL[Email Lambda]
+        SML[SMS Lambda]
+        PL[Push Lambda]
+        SLL[Slack Lambda]
+    end
+    
+    subgraph "Delivery Services"
+        EDAS[Email Delivery<br/>Ack Service]
+        BS2[BS2 Email]
+        SNS[AWS SNS]
+        FCM[FCM/APNS]
+        Slack[Slack API]
+    end
+    
+    subgraph "Status Tracking"
+        SSE[SSE Service]
+        WH[Webhooks]
+        Metrics[CloudWatch]
+    end
+    
+    %% Creation flows
+    U1 -->|Scheduled| API
+    U2 -->|JIT Event| API
+    U3 -->|API Call| API
+    
+    %% Routing
+    API --> RD
+    RD -->|JIT| JV
+    RD -->|Scheduled| SA
+    
+    %% Validation
+    JV -->|Check Limits| Redis
+    JV -->|Valid| MongoDB
+    SA -->|Assign Slot| MongoDB
+    
+    %% Processing paths
+    MongoDB -->|Scheduled| EB
+    MongoDB -->|JIT| JQ
+    
+    %% Scheduled flow
+    EB -->|Trigger| SL
+    SL -->|Process| SQ1
+    SQ1 --> EventBus
+    
+    %% JIT flow
+    JQ -->|Immediate| JL
+    JL --> EventBus
+    
+    %% Channel routing
+    EventBus --> ER --> EL
+    EventBus --> SR --> SML
+    EventBus --> PR --> PL
+    EventBus --> SLR --> SLL
+    
+    %% Delivery
+    EL --> EDAS --> BS2
+    SML --> SNS
+    PL --> FCM
+    SLL --> Slack
+    
+    %% Status updates
+    EDAS --> WH
+    WH --> SSE
+    EventBus --> Metrics
+    
+    style JQ fill:#ff9999
+    style JL fill:#ff9999
+    style JV fill:#ff9999
+    style EB fill:#99ccff
+    style SL fill:#99ccff
+    style SA fill:#99ccff
