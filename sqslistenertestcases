@@ -1,0 +1,1217 @@
+# Spring Boot SQS Application using AWS SDK v2
+
+## Project Structure
+```
+src/
+├── main/
+│   ├── java/
+│   │   └── com/example/sqsapp/
+│   │       ├── SqsApplication.java
+│   │       ├── config/
+│   │       │   └── SqsConfig.java
+│   │       ├── listener/
+│   │       │   └── SqsMessageListener.java
+│   │       ├── service/
+│   │       │   └── MessageProcessorService.java
+│   │       └── model/
+│   │           └── Message.java
+│   └── resources/
+│       └── application.yml
+└── test/
+    ├── java/
+    │   └── com/example/sqsapp/
+    │       ├── listener/
+    │       │   └── SqsMessageListenerTest.java
+    │       ├── service/
+    │       │   └── MessageProcessorServiceTest.java
+    │       └── integration/
+    │           └── SqsIntegrationTest.java
+    └── resources/
+        └── application-test.yml
+```
+
+## 1. pom.xml
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+         http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.2.0</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.example</groupId>
+    <artifactId>sqs-listener-app</artifactId>
+    <version>1.0.0</version>
+    <name>SQS Listener Application</name>
+
+    <properties>
+        <java.version>17</java.version>
+        <aws-sdk.version>2.21.0</aws-sdk.version>
+    </properties>
+
+    <dependencies>
+        <!-- Spring Boot Starters -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <!-- AWS SDK v2 for SQS -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>sqs</artifactId>
+            <version>${aws-sdk.version}</version>
+        </dependency>
+
+        <!-- AWS SDK v2 STS for IAM role support -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>sts</artifactId>
+            <version>${aws-sdk.version}</version>
+        </dependency>
+
+        <!-- Jackson for JSON processing -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+        
+        <dependency>
+            <groupId>com.fasterxml.jackson.datatype</groupId>
+            <artifactId>jackson-datatype-jsr310</artifactId>
+        </dependency>
+
+        <!-- Lombok -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- Test Dependencies -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- ElasticMQ for embedded SQS testing (no Docker required) -->
+        <dependency>
+            <groupId>org.elasticmq</groupId>
+            <artifactId>elasticmq-rest-sqs_2.13</artifactId>
+            <version>1.4.2</version>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Awaitility for async testing -->
+        <dependency>
+            <groupId>org.awaitility</groupId>
+            <artifactId>awaitility</artifactId>
+            <version>4.2.0</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <configuration>
+                    <excludes>
+                        <exclude>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                        </exclude>
+                    </excludes>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+```
+
+## 2. Main Application Class
+
+```java
+package com.example.sqsapp;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.scheduling.annotation.EnableScheduling;
+
+@SpringBootApplication
+@EnableScheduling
+public class SqsApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(SqsApplication.class, args);
+    }
+}
+```
+
+## 3. Configuration
+
+### SqsConfig.java
+```java
+package com.example.sqsapp.config;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Profile;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.sqs.SqsClient;
+
+import java.net.URI;
+
+@Configuration
+public class SqsConfig {
+
+    @Value("${aws.region:us-east-1}")
+    private String region;
+
+    @Value("${aws.sqs.endpoint:#{null}}")
+    private String endpoint;
+
+    @Value("${aws.sqs.queue-url:#{null}}")
+    private String queueUrl;
+
+    /**
+     * Production configuration using IAM role
+     * Uses the default credential provider chain:
+     * - Environment variables
+     * - System properties
+     * - Web Identity Token (EKS with IRSA)
+     * - Profile credentials
+     * - Container credentials (ECS/Fargate)
+     * - Instance profile credentials (EC2)
+     */
+    @Bean
+    @Profile("!test")
+    public SqsClient sqsClient() {
+        var builder = SqsClient.builder()
+                .region(Region.of(region))
+                .credentialsProvider(DefaultCredentialsProvider.create());
+
+        // For local development with LocalStack
+        if (endpoint != null && !endpoint.isEmpty()) {
+            builder.endpointOverride(URI.create(endpoint));
+        }
+
+        return builder.build();
+    }
+
+    /**
+     * Test configuration with static credentials
+     */
+    @Bean
+    @Profile("test")
+    public SqsClient testSqsClient(
+            @Value("${aws.access-key:test}") String accessKey,
+            @Value("${aws.secret-key:test}") String secretKey) {
+        
+        var builder = SqsClient.builder()
+                .region(Region.of(region))
+                .credentialsProvider(StaticCredentialsProvider.create(
+                        AwsBasicCredentials.create(accessKey, secretKey)
+                ));
+
+        if (endpoint != null && !endpoint.isEmpty()) {
+            builder.endpointOverride(URI.create(endpoint));
+        }
+
+        return builder.build();
+    }
+
+    @Bean
+    public ObjectMapper objectMapper() {
+        ObjectMapper mapper = new ObjectMapper();
+        mapper.registerModule(new JavaTimeModule());
+        return mapper;
+    }
+
+    @Bean
+    public String queueUrl(SqsClient sqsClient, @Value("${aws.sqs.queue-name}") String queueName) {
+        // If queue URL is directly provided, use it
+        if (queueUrl != null && !queueUrl.isEmpty()) {
+            return queueUrl;
+        }
+        
+        // Otherwise, get the queue URL from the queue name
+        try {
+            return sqsClient.getQueueUrl(r -> r.queueName(queueName)).queueUrl();
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to get queue URL for queue: " + queueName, e);
+        }
+    }
+}
+```
+
+## 4. Model
+
+### Message.java
+```java
+package com.example.sqsapp.model;
+
+import com.fasterxml.jackson.annotation.JsonFormat;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.time.LocalDateTime;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class Message {
+    private String id;
+    private String content;
+    private String type;
+    
+    @JsonFormat(pattern = "yyyy-MM-dd'T'HH:mm:ss")
+    private LocalDateTime timestamp;
+}
+```
+
+## 5. Service Layer
+
+### MessageProcessorService.java
+```java
+package com.example.sqsapp.service;
+
+import com.example.sqsapp.model.Message;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+@Slf4j
+@Service
+public class MessageProcessorService {
+
+    public void processMessage(Message message) {
+        log.info("Processing message: {}", message);
+        
+        // Validate message
+        validateMessage(message);
+        
+        // Process based on type
+        switch (message.getType()) {
+            case "ORDER":
+                processOrderMessage(message);
+                break;
+            case "NOTIFICATION":
+                processNotificationMessage(message);
+                break;
+            default:
+                log.warn("Unknown message type: {}", message.getType());
+        }
+        
+        log.info("Message processed successfully: {}", message.getId());
+    }
+
+    private void validateMessage(Message message) {
+        if (message.getId() == null || message.getId().isEmpty()) {
+            throw new IllegalArgumentException("Message ID is required");
+        }
+        if (message.getContent() == null || message.getContent().isEmpty()) {
+            throw new IllegalArgumentException("Message content is required");
+        }
+        if (message.getType() == null || message.getType().isEmpty()) {
+            throw new IllegalArgumentException("Message type is required");
+        }
+    }
+
+    private void processOrderMessage(Message message) {
+        log.info("Processing order message: {}", message.getContent());
+        // Add your order processing logic here
+        // For example: save to database, trigger workflows, etc.
+    }
+
+    private void processNotificationMessage(Message message) {
+        log.info("Processing notification message: {}", message.getContent());
+        // Add your notification processing logic here
+        // For example: send emails, push notifications, etc.
+    }
+}
+```
+
+## 6. SQS Listener
+
+### SqsMessageListener.java
+```java
+package com.example.sqsapp.listener;
+
+import com.example.sqsapp.model.Message;
+import com.example.sqsapp.service.MessageProcessorService;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+import software.amazon.awssdk.services.sqs.SqsClient;
+import software.amazon.awssdk.services.sqs.model.*;
+
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class SqsMessageListener {
+
+    private final SqsClient sqsClient;
+    private final MessageProcessorService messageProcessorService;
+    private final ObjectMapper objectMapper;
+    private final String queueUrl;
+
+    @Value("${aws.sqs.max-messages:10}")
+    private int maxMessages;
+
+    @Value("${aws.sqs.wait-time-seconds:20}")
+    private int waitTimeSeconds;
+
+    @Value("${aws.sqs.visibility-timeout:30}")
+    private int visibilityTimeout;
+
+    @Value("${aws.sqs.listener.enabled:true}")
+    private boolean listenerEnabled;
+
+    private final ExecutorService executorService = Executors.newFixedThreadPool(10);
+    private volatile boolean running = true;
+
+    @PostConstruct
+    public void init() {
+        log.info("SQS Listener initialized for queue: {}", queueUrl);
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        log.info("Shutting down SQS listener...");
+        running = false;
+        executorService.shutdown();
+    }
+
+    /**
+     * Poll for messages every second if no messages were found,
+     * or immediately if messages were processed
+     */
+    @Scheduled(fixedDelay = 1000)
+    public void pollMessages() {
+        if (!listenerEnabled || !running) {
+            return;
+        }
+
+        try {
+            ReceiveMessageRequest receiveRequest = ReceiveMessageRequest.builder()
+                    .queueUrl(queueUrl)
+                    .maxNumberOfMessages(maxMessages)
+                    .waitTimeSeconds(waitTimeSeconds)
+                    .visibilityTimeout(visibilityTimeout)
+                    .build();
+
+            ReceiveMessageResponse response = sqsClient.receiveMessage(receiveRequest);
+            List<software.amazon.awssdk.services.sqs.model.Message> messages = response.messages();
+
+            if (!messages.isEmpty()) {
+                log.debug("Received {} messages from SQS", messages.size());
+                processMessages(messages);
+            }
+        } catch (Exception e) {
+            log.error("Error polling messages from SQS: {}", e.getMessage(), e);
+        }
+    }
+
+    private void processMessages(List<software.amazon.awssdk.services.sqs.model.Message> sqsMessages) {
+        List<CompletableFuture<Void>> futures = sqsMessages.stream()
+                .map(sqsMessage -> CompletableFuture.runAsync(() -> processMessage(sqsMessage), executorService))
+                .toList();
+
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+    }
+
+    private void processMessage(software.amazon.awssdk.services.sqs.model.Message sqsMessage) {
+        String messageId = sqsMessage.messageId();
+        String receiptHandle = sqsMessage.receiptHandle();
+        
+        log.info("Processing message with ID: {}", messageId);
+        
+        try {
+            // Parse the message body
+            Message message = objectMapper.readValue(sqsMessage.body(), Message.class);
+            
+            // Process the message
+            messageProcessorService.processMessage(message);
+            
+            // Delete the message from the queue after successful processing
+            deleteMessage(receiptHandle);
+            log.info("Successfully processed and deleted message: {}", messageId);
+            
+        } catch (Exception e) {
+            log.error("Error processing message {}: {}", messageId, e.getMessage(), e);
+            // Message will become visible again after visibility timeout
+            // and will be retried
+        }
+    }
+
+    private void deleteMessage(String receiptHandle) {
+        try {
+            DeleteMessageRequest deleteRequest = DeleteMessageRequest.builder()
+                    .queueUrl(queueUrl)
+                    .receiptHandle(receiptHandle)
+                    .build();
+            
+            sqsClient.deleteMessage(deleteRequest);
+        } catch (Exception e) {
+            log.error("Failed to delete message with receipt handle {}: {}", receiptHandle, e.getMessage());
+        }
+    }
+}
+```
+
+## 7. Application Configuration
+
+### application.yml
+```yaml
+spring:
+  application:
+    name: sqs-listener-app
+
+aws:
+  region: ${AWS_REGION:us-east-1}
+  sqs:
+    queue-name: ${SQS_QUEUE_NAME:my-queue}
+    queue-url: ${SQS_QUEUE_URL:}  # Optional: directly provide queue URL
+    max-messages: 10
+    wait-time-seconds: 20  # Long polling
+    visibility-timeout: 30
+    listener:
+      enabled: true
+
+logging:
+  level:
+    com.example.sqsapp: DEBUG
+    software.amazon.awssdk: INFO
+    software.amazon.awssdk.auth: DEBUG  # To debug credential provider chain
+```
+
+### application-local-dev.yml (for local development)
+```yaml
+# Local development profile for testing without AWS
+spring:
+  profiles:
+    active: test
+
+aws:
+  sqs:
+    endpoint: http://localhost:9324  # ElasticMQ endpoint
+  access-key: test
+  secret-key: test
+```
+
+### application-prod.yml (for production with IAM role)
+```yaml
+# Production profile - uses IAM role automatically
+aws:
+  region: ${AWS_REGION:us-east-1}
+  sqs:
+    queue-name: ${SQS_QUEUE_NAME}
+    listener:
+      enabled: true
+
+logging:
+  level:
+    com.example.sqsapp: INFO
+    software.amazon.awssdk: WARN
+```
+
+## 8. Unit Tests
+
+### MessageProcessorServiceTest.java
+```java
+package com.example.sqsapp.service;
+
+import com.example.sqsapp.model.Message;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import java.time.LocalDateTime;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+@ExtendWith(MockitoExtension.class)
+class MessageProcessorServiceTest {
+
+    @InjectMocks
+    private MessageProcessorService messageProcessorService;
+
+    private Message validMessage;
+
+    @BeforeEach
+    void setUp() {
+        validMessage = new Message(
+                "msg-123",
+                "Test content",
+                "ORDER",
+                LocalDateTime.now()
+        );
+    }
+
+    @Test
+    void processMessage_ValidOrderMessage_ShouldProcessSuccessfully() {
+        assertDoesNotThrow(() -> messageProcessorService.processMessage(validMessage));
+    }
+
+    @Test
+    void processMessage_ValidNotificationMessage_ShouldProcessSuccessfully() {
+        validMessage.setType("NOTIFICATION");
+        assertDoesNotThrow(() -> messageProcessorService.processMessage(validMessage));
+    }
+
+    @Test
+    void processMessage_UnknownType_ShouldNotThrowException() {
+        validMessage.setType("UNKNOWN");
+        assertDoesNotThrow(() -> messageProcessorService.processMessage(validMessage));
+    }
+
+    @Test
+    void processMessage_NullId_ShouldThrowException() {
+        validMessage.setId(null);
+        
+        IllegalArgumentException exception = assertThrows(
+                IllegalArgumentException.class,
+                () -> messageProcessorService.processMessage(validMessage)
+        );
+        
+        assertEquals("Message ID is required", exception.getMessage());
+    }
+
+    @Test
+    void processMessage_EmptyContent_ShouldThrowException() {
+        validMessage.setContent("");
+        
+        IllegalArgumentException exception = assertThrows(
+                IllegalArgumentException.class,
+                () -> messageProcessorService.processMessage(validMessage)
+        );
+        
+        assertEquals("Message content is required", exception.getMessage());
+    }
+
+    @Test
+    void processMessage_NullType_ShouldThrowException() {
+        validMessage.setType(null);
+        
+        IllegalArgumentException exception = assertThrows(
+                IllegalArgumentException.class,
+                () -> messageProcessorService.processMessage(validMessage)
+        );
+        
+        assertEquals("Message type is required", exception.getMessage());
+    }
+}
+```
+
+### SqsMessageListenerTest.java
+```java
+package com.example.sqsapp.listener;
+
+import com.example.sqsapp.model.Message;
+import com.example.sqsapp.service.MessageProcessorService;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.test.util.ReflectionTestUtils;
+import software.amazon.awssdk.services.sqs.SqsClient;
+import software.amazon.awssdk.services.sqs.model.DeleteMessageRequest;
+import software.amazon.awssdk.services.sqs.model.ReceiveMessageRequest;
+import software.amazon.awssdk.services.sqs.model.ReceiveMessageResponse;
+
+import java.time.LocalDateTime;
+import java.util.List;
+
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class SqsMessageListenerTest {
+
+    @Mock
+    private SqsClient sqsClient;
+
+    @Mock
+    private MessageProcessorService messageProcessorService;
+
+    private ObjectMapper objectMapper;
+    private SqsMessageListener sqsMessageListener;
+    private String queueUrl = "http://localhost:9324/queue/test-queue";
+
+    @BeforeEach
+    void setUp() {
+        objectMapper = new ObjectMapper();
+        objectMapper.registerModule(new com.fasterxml.jackson.datatype.jsr310.JavaTimeModule());
+        
+        sqsMessageListener = new SqsMessageListener(
+                sqsClient,
+                messageProcessorService,
+                objectMapper,
+                queueUrl
+        );
+        
+        // Set field values using reflection
+        ReflectionTestUtils.setField(sqsMessageListener, "maxMessages", 10);
+        ReflectionTestUtils.setField(sqsMessageListener, "waitTimeSeconds", 20);
+        ReflectionTestUtils.setField(sqsMessageListener, "visibilityTimeout", 30);
+        ReflectionTestUtils.setField(sqsMessageListener, "listenerEnabled", true);
+    }
+
+    @Test
+    void pollMessages_WithValidMessage_ShouldProcessAndDelete() throws Exception {
+        // Given
+        Message message = new Message("msg-456", "Test content", "ORDER", LocalDateTime.now());
+        String messageJson = objectMapper.writeValueAsString(message);
+        
+        software.amazon.awssdk.services.sqs.model.Message sqsMessage = 
+                software.amazon.awssdk.services.sqs.model.Message.builder()
+                        .messageId("sqs-msg-id")
+                        .receiptHandle("receipt-handle")
+                        .body(messageJson)
+                        .build();
+        
+        ReceiveMessageResponse response = ReceiveMessageResponse.builder()
+                .messages(List.of(sqsMessage))
+                .build();
+        
+        when(sqsClient.receiveMessage(any(ReceiveMessageRequest.class))).thenReturn(response);
+        
+        // When
+        sqsMessageListener.pollMessages();
+        
+        // Then
+        verify(sqsClient).receiveMessage(any(ReceiveMessageRequest.class));
+        verify(messageProcessorService).processMessage(any(Message.class));
+        verify(sqsClient).deleteMessage(any(DeleteMessageRequest.class));
+    }
+
+    @Test
+    void pollMessages_WhenProcessingFails_ShouldNotDeleteMessage() throws Exception {
+        // Given
+        Message message = new Message("msg-789", "Test content", "ORDER", LocalDateTime.now());
+        String messageJson = objectMapper.writeValueAsString(message);
+        
+        software.amazon.awssdk.services.sqs.model.Message sqsMessage = 
+                software.amazon.awssdk.services.sqs.model.Message.builder()
+                        .messageId("sqs-msg-id-2")
+                        .receiptHandle("receipt-handle-2")
+                        .body(messageJson)
+                        .build();
+        
+        ReceiveMessageResponse response = ReceiveMessageResponse.builder()
+                .messages(List.of(sqsMessage))
+                .build();
+        
+        when(sqsClient.receiveMessage(any(ReceiveMessageRequest.class))).thenReturn(response);
+        doThrow(new RuntimeException("Processing failed")).when(messageProcessorService).processMessage(any());
+        
+        // When
+        sqsMessageListener.pollMessages();
+        
+        // Then
+        verify(sqsClient).receiveMessage(any(ReceiveMessageRequest.class));
+        verify(messageProcessorService).processMessage(any(Message.class));
+        verify(sqsClient, never()).deleteMessage(any(DeleteMessageRequest.class));
+    }
+
+    @Test
+    void pollMessages_WhenNoMessages_ShouldNotProcess() {
+        // Given
+        ReceiveMessageResponse response = ReceiveMessageResponse.builder()
+                .messages(List.of())
+                .build();
+        
+        when(sqsClient.receiveMessage(any(ReceiveMessageRequest.class))).thenReturn(response);
+        
+        // When
+        sqsMessageListener.pollMessages();
+        
+        // Then
+        verify(sqsClient).receiveMessage(any(ReceiveMessageRequest.class));
+        verify(messageProcessorService, never()).processMessage(any());
+        verify(sqsClient, never()).deleteMessage(any());
+    }
+}
+```
+
+## 9. Integration Test (Without Docker)
+
+### SqsIntegrationTest.java
+```java
+package com.example.sqsapp.integration;
+
+import com.example.sqsapp.model.Message;
+import com.example.sqsapp.service.MessageProcessorService;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.elasticmq.rest.sqs.SQSRestServer;
+import org.elasticmq.rest.sqs.SQSRestServerBuilder;
+import org.junit.jupiter.api.*;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.mock.mockito.SpyBean;
+import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import software.amazon.awssdk.services.sqs.SqsClient;
+import software.amazon.awssdk.services.sqs.model.CreateQueueRequest;
+import software.amazon.awssdk.services.sqs.model.SendMessageRequest;
+
+import java.time.LocalDateTime;
+import java.util.concurrent.TimeUnit;
+
+import static org.awaitility.Awaitility.await;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.verify;
+
+@SpringBootTest
+@ActiveProfiles("test")
+@TestInstance(TestInstance.Lifecycle.PER_CLASS)
+class SqsIntegrationTest {
+
+    private static SQSRestServer sqsServer;
+    private static final int PORT = 9324;
+    private static String queueUrl;
+
+    @Autowired
+    private SqsClient sqsClient;
+
+    @Autowired
+    private ObjectMapper objectMapper;
+
+    @SpyBean
+    private MessageProcessorService messageProcessorService;
+
+    @BeforeAll
+    void setUp() {
+        // Start ElasticMQ server
+        sqsServer = SQSRestServerBuilder
+                .withPort(PORT)
+                .withInterface("localhost")
+                .start();
+        
+        // Wait for server to start
+        try {
+            Thread.sleep(1000);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    @AfterAll
+    void tearDown() {
+        if (sqsServer != null) {
+            sqsServer.stopAndWait();
+        }
+    }
+
+    @BeforeEach
+    void createQueue() {
+        // Create queue for each test
+        queueUrl = sqsClient.createQueue(CreateQueueRequest.builder()
+                .queueName("test-queue-" + System.currentTimeMillis())
+                .build()).queueUrl();
+    }
+
+    @DynamicPropertySource
+    static void properties(DynamicPropertyRegistry registry) {
+        registry.add("aws.sqs.endpoint", () -> "http://localhost:" + PORT);
+        registry.add("aws.region", () -> "us-east-1");
+        registry.add("aws.access-key", () -> "test");
+        registry.add("aws.secret-key", () -> "test");
+        registry.add("aws.sqs.queue-url", () -> "http://localhost:" + PORT + "/queue/my-queue");
+        registry.add("aws.sqs.listener.enabled", () -> "true");
+    }
+
+    @Test
+    void whenMessageSentToQueue_thenMessageIsProcessed() throws Exception {
+        // Given
+        Message message = new Message(
+                "integration-test-123",
+                "Integration test message content",
+                "NOTIFICATION",
+                LocalDateTime.now()
+        );
+        
+        String messageJson = objectMapper.writeValueAsString(message);
+        
+        // When - Send message to queue
+        sqsClient.sendMessage(SendMessageRequest.builder()
+                .queueUrl(queueUrl)
+                .messageBody(messageJson)
+                .build());
+        
+        // Then - Verify message is processed
+        await().atMost(15, TimeUnit.SECONDS)
+                .pollInterval(1, TimeUnit.SECONDS)
+                .untilAsserted(() -> {
+                    verify(messageProcessorService).processMessage(any(Message.class));
+                });
+    }
+
+    @Test
+    void whenMultipleMessagesSent_thenAllAreProcessed() throws Exception {
+        // Given
+        int messageCount = 5;
+        
+        for (int i = 0; i < messageCount; i++) {
+            Message message = new Message(
+                    "msg-" + i,
+                    "Message content " + i,
+                    i % 2 == 0 ? "ORDER" : "NOTIFICATION",
+                    LocalDateTime.now()
+            );
+            
+            String messageJson = objectMapper.writeValueAsString(message);
+            
+            sqsClient.sendMessage(SendMessageRequest.builder()
+                    .queueUrl(queueUrl)
+                    .messageBody(messageJson)
+                    .build());
+        }
+        
+        // Then - Verify all messages are processed
+        await().atMost(20, TimeUnit.SECONDS)
+                .pollInterval(1, TimeUnit.SECONDS)
+                .untilAsserted(() -> {
+                    verify(messageProcessorService, org.mockito.Mockito.times(messageCount))
+                            .processMessage(any(Message.class));
+                });
+    }
+}
+```
+
+### application-test.yml
+```yaml
+spring:
+  application:
+    name: sqs-listener-app-test
+  profiles:
+    active: test
+
+aws:
+  region: us-east-1
+  access-key: test
+  secret-key: test
+  sqs:
+    queue-name: my-queue
+    endpoint: http://localhost:9324
+    listener:
+      enabled: true
+    max-messages: 5
+    wait-time-seconds: 1  # Shorter for tests
+    visibility-timeout: 10
+
+logging:
+  level:
+    com.example.sqsapp: DEBUG
+    software.amazon.awssdk: INFO
+```
+
+## 10. Running the Application
+
+### Build and Run
+```bash
+# Build the application
+mvn clean package
+
+# Run unit tests only
+mvn test
+
+# Run all tests including integration tests
+mvn verify
+
+# Run the application locally with ElasticMQ (no Docker needed)
+# First, start ElasticMQ in a separate terminal:
+java -jar elasticmq-server-1.4.2.jar
+
+# Then run the application
+mvn spring-boot:run -Dspring.profiles.active=local-dev
+
+# Run the application in production (uses IAM role)
+mvn spring-boot:run -Dspring.profiles.active=prod
+
+# Or with JAR
+java -jar target/sqs-listener-app-1.0.0.jar --spring.profiles.active=prod
+```
+
+### Deployment on AWS
+
+#### EC2 Instance
+1. **Create and attach IAM Role** to EC2 instance with the following policy:
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "sqs:ReceiveMessage",
+                "sqs:DeleteMessage",
+                "sqs:GetQueueAttributes",
+                "sqs:GetQueueUrl"
+            ],
+            "Resource": "arn:aws:sqs:us-east-1:*:your-queue-name"
+        }
+    ]
+}
+```
+
+2. **Deploy and run**:
+```bash
+# Copy JAR to EC2
+scp target/sqs-listener-app-1.0.0.jar ec2-user@your-instance:/home/ec2-user/
+
+# SSH to instance and run
+java -jar sqs-listener-app-1.0.0.jar --spring.profiles.active=prod
+```
+
+#### ECS/Fargate
+1. **Create Task Execution Role** and **Task Role**:
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "sqs:ReceiveMessage",
+                "sqs:DeleteMessage",
+                "sqs:GetQueueAttributes",
+                "sqs:GetQueueUrl"
+            ],
+            "Resource": "arn:aws:sqs:*:*:*"
+        }
+    ]
+}
+```
+
+2. **Dockerfile**:
+```dockerfile
+FROM openjdk:17-jdk-slim
+COPY target/sqs-listener-app-1.0.0.jar app.jar
+ENTRYPOINT ["java", "-jar", "/app.jar", "--spring.profiles.active=prod"]
+```
+
+3. **Task Definition Environment Variables**:
+```json
+{
+  "environment": [
+    {"name": "AWS_REGION", "value": "us-east-1"},
+    {"name": "SQS_QUEUE_NAME", "value": "your-queue-name"}
+  ]
+}
+```
+
+#### EKS with IRSA
+1. **Create IAM Role for Service Account**:
+```bash
+eksctl create iamserviceaccount \
+  --cluster=your-cluster \
+  --namespace=default \
+  --name=sqs-listener-sa \
+  --attach-policy-arn=arn:aws:iam::aws:policy/AmazonSQSFullAccess \
+  --approve
+```
+
+2. **Kubernetes Deployment**:
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sqs-listener
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: sqs-listener
+  template:
+    metadata:
+      labels:
+        app: sqs-listener
+    spec:
+      serviceAccountName: sqs-listener-sa
+      containers:
+      - name: app
+        image: your-registry/sqs-listener:latest
+        env:
+        - name: SPRING_PROFILES_ACTIVE
+          value: "prod"
+        - name: AWS_REGION
+          value: "us-east-1"
+        - name: SQS_QUEUE_NAME
+          value: "your-queue-name"
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+```
+
+### Local Development Setup
+
+#### Option 1: Using ElasticMQ (No Docker Required)
+```bash
+# Download ElasticMQ
+wget https://s3-eu-west-1.amazonaws.com/softwaremill-public/elasticmq-server-1.4.2.jar
+
+# Start ElasticMQ
+java -jar elasticmq-server-1.4.2.jar
+
+# Run application
+mvn spring-boot:run -Dspring.profiles.active=local-dev
+```
+
+#### Option 2: Using AWS Profile
+```bash
+# Configure AWS profile
+aws configure --profile dev-profile
+
+# Run with profile
+AWS_PROFILE=dev-profile mvn spring-boot:run
+```
+
+## Key Features
+
+1. **Native AWS SDK v2**: Direct use of `software.amazon.awssdk:sqs` for better control
+2. **IAM Role Support**: Automatic credential detection via DefaultCredentialsProvider
+3. **Long Polling**: Efficient message retrieval with configurable wait time
+4. **Concurrent Processing**: Thread pool for parallel message processing
+5. **Automatic Retry**: Failed messages return to queue after visibility timeout
+6. **Graceful Shutdown**: Proper cleanup of resources on application shutdown
+7. **No Docker Required**: ElasticMQ for local testing without containers
+8. **Profile-based Configuration**: Separate configs for dev, test, and production
+
+## Architecture Benefits
+
+### Using AWS SDK v2 Directly
+- **More Control**: Direct access to all SQS features
+- **Better Performance**: Fine-tuned polling and processing
+- **Simpler Dependencies**: No Spring Cloud AWS overhead
+- **Clear Error Handling**: Explicit message acknowledgment/deletion
+
+### Message Processing Flow
+1. **Poll**: Scheduled task polls SQS using long polling
+2. **Receive**: Batch receive up to 10 messages
+3. **Process**: Concurrent processing using thread pool
+4. **Acknowledge**: Delete message on success
+5. **Retry**: Failed messages become visible after timeout
+
+## Monitoring and Observability
+
+### CloudWatch Metrics
+The application automatically sends metrics to CloudWatch:
+- Number of messages received
+- Number of messages deleted
+- Number of empty receives
+
+### Application Metrics
+Add these endpoints for monitoring:
+
+```java
+@RestController
+@RequestMapping("/metrics")
+public class MetricsController {
+    
+    @Autowired
+    private SqsMessageListener listener;
+    
+    @GetMapping("/health")
+    public ResponseEntity<Map<String, String>> health() {
+        Map<String, String> status = new HashMap<>();
+        status.put("status", "UP");
+        status.put("queue", queueUrl);
+        return ResponseEntity.ok(status);
+    }
+}
+```
+
+## Troubleshooting
+
+### Common Issues
+
+1. **Credentials Not Found**
+   - Check IAM role is attached to EC2/ECS/EKS
+   - Verify role has SQS permissions
+   - Check AWS_REGION is set
+
+2. **Queue Not Found**
+   - Verify queue name and region
+   - Check queue exists in AWS console
+   - Ensure IAM role has GetQueueUrl permission
+
+3. **Messages Not Processing**
+   - Check `listener.enabled` is true
+   - Verify message format matches Message class
+   - Check logs for deserialization errors
+
+4. **High Message Latency**
+   - Adjust visibility timeout
+   - Increase thread pool size
+   - Optimize message processing logic
+
+## Performance Tuning
+
+### Configuration Options
+```yaml
+aws:
+  sqs:
+    max-messages: 10          # Messages per poll (1-10)
+    wait-time-seconds: 20     # Long polling timeout (0-20)
+    visibility-timeout: 30    # Processing time allowance
+    
+# Thread pool for processing
+spring:
+  task:
+    execution:
+      pool:
+        core-size: 10
+        max-size: 20
+```
+
+### Best Practices
+1. Use long polling (wait-time-seconds > 0)
+2. Process messages in parallel
+3. Set appropriate visibility timeout
+4. Implement idempotent processing
+5. Use Dead Letter Queue for failed messages
+6. Monitor CloudWatch metrics
+
+## Notes
+
+- The application uses native AWS SDK v2 for direct SQS integration
+- DefaultCredentialsProvider automatically detects IAM roles
+- ElasticMQ provides local SQS implementation for testing
+- Messages are processed concurrently for better throughput
+- Failed messages automatically retry via SQS visibility timeout
