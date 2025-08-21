@@ -1,0 +1,3257 @@
+Skip to content
+Chat history
+
+You said:
+write sqs consumer in ecs service called router service where message will be consumed once by router  service. There can be multiple instances of router service.
+ChatGPT said:
+Got it 👍 — you want to build an ECS service ("Router Service") that consumes messages from SQS, ensuring that even though multiple instances of the Router Service may run, each message is consumed only once.
+
+Here’s a solid approach:
+
+🔹 Key AWS Concepts
+SQS Standard Queue – At-least-once delivery (can duplicate). If you want exactly-once, use FIFO SQS with deduplication.
+
+Visibility Timeout – Ensures once a consumer picks a message, others don’t see it until processing is done or timeout expires.
+
+Delete After Processing – You must delete the message once processing succeeds.
+
+Scaling in ECS – Multiple ECS tasks (router service instances) can poll SQS in parallel safely. SQS takes care of distributing messages across consumers.
+
+🔹 Architecture
+SQS Queue → Router Service running in ECS (Fargate/EC2).
+
+Each Router Service task polls SQS → processes messages → deletes them after success.
+
+Use long polling to reduce cost and latency.
+
+Optionally, integrate DLQ (Dead Letter Queue) for failed messages.
+
+🔹 Example: Router Service (Python + Boto3)
+import boto3
+import json
+import time
+import logging
+import os
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+sqs = boto3.client("sqs", region_name=os.getenv("AWS_REGION"))
+queue_url = os.getenv("SQS_QUEUE_URL")
+
+def process_message(message_body):
+    """
+    Process the message logic here.
+    """
+    logger.info(f"Processing message: {message_body}")
+    # Your router service logic goes here...
+    time.sleep(2)  # simulate work
+    return True  # return False if failed
+
+
+def consume_messages():
+    while True:
+        try:
+            response = sqs.receive_message(
+                QueueUrl=queue_url,
+                MaxNumberOfMessages=1,        # process one at a time
+                WaitTimeSeconds=20,           # long polling
+                VisibilityTimeout=30          # give enough time to process
+            )
+
+            messages = response.get("Messages", [])
+            if not messages:
+                continue
+
+            for msg in messages:
+                receipt_handle = msg["ReceiptHandle"]
+                body = msg["Body"]
+
+                try:
+                    success = process_message(body)
+                    if success:
+                        sqs.delete_message(
+                            QueueUrl=queue_url,
+                            ReceiptHandle=receipt_handle
+                        )
+                        logger.info("Message processed & deleted.")
+                    else:
+                        logger.warning("Message processing failed, not deleting (will retry).")
+
+                except Exception as e:
+                    logger.error(f"Error processing message: {e}", exc_info=True)
+
+        except Exception as e:
+            logger.error(f"Error receiving messages: {e}", exc_info=True)
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    logger.info("Starting Router Service Consumer...")
+    consume_messages()
+🔹 ECS Service Setup
+Dockerize the above Python script. Example Dockerfile:
+
+FROM python:3.11-slim
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+COPY router_service.py .
+
+CMD ["python", "router_service.py"]
+requirements.txt
+
+boto3
+Deploy to ECS:
+
+Create ECS service (router-service) with multiple tasks.
+
+Set env vars: AWS_REGION, SQS_QUEUE_URL.
+
+Attach IAM role with permission for sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes.
+
+🔹 Ensuring "Once Only" Consumption
+With multiple instances, SQS guarantees each message is delivered to only one consumer at a time.
+
+If a task crashes before delete_message, SQS will re-deliver after VisibilityTimeout.
+
+For exactly-once semantics → Use FIFO SQS with deduplication ID.
+
+👉 Do you want me to also add CloudWatch alarms + DLQ handling for production readiness, or keep it as a lightweight ECS consumer?
+
+You said:
+write in java 
+ChatGPT said:
+Perfect 👍 You want the Router Service SQS consumer in Java, running in ECS, where multiple instances can run but each message is consumed once.
+
+Here’s a production-ready Java version using the AWS SDK v2:
+
+🔹 Maven Dependencies (pom.xml)
+<dependencies>
+    <!-- AWS SDK v2 for SQS -->
+    <dependency>
+        <groupId>software.amazon.awssdk</groupId>
+        <artifactId>sqs</artifactId>
+        <version>2.20.120</version>
+    </dependency>
+
+    <!-- Logging -->
+    <dependency>
+        <groupId>org.slf4j</groupId>
+        <artifactId>slf4j-api</artifactId>
+        <version>2.0.7</version>
+    </dependency>
+    <dependency>
+        <groupId>ch.qos.logback</groupId>
+        <artifactId>logback-classic</artifactId>
+        <version>1.4.7</version>
+    </dependency>
+</dependencies>
+🔹 Router Service Consumer (RouterService.java)
+package com.example.router;
+
+import software.amazon.awssdk.services.sqs.SqsClient;
+import software.amazon.awssdk.services.sqs.model.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.net.URI;
+import java.time.Duration;
+import java.util.List;
+
+public class RouterService {
+
+    private static final Logger logger = LoggerFactory.getLogger(RouterService.class);
+    private final SqsClient sqsClient;
+    private final String queueUrl;
+
+    public RouterService(String queueUrl) {
+        this.sqsClient = SqsClient.builder()
+                .build(); // IAM role in ECS provides credentials + region
+        this.queueUrl = queueUrl;
+    }
+
+    public void start() {
+        logger.info("Starting Router Service consumer...");
+        while (true) {
+            try {
+                ReceiveMessageRequest receiveRequest = ReceiveMessageRequest.builder()
+                        .queueUrl(queueUrl)
+                        .maxNumberOfMessages(1)   // fetch one at a time
+                        .waitTimeSeconds(20)      // long polling
+                        .visibilityTimeout(30)    // time to process before message reappears
+                        .build();
+
+                List<Message> messages = sqsClient.receiveMessage(receiveRequest).messages();
+
+                if (messages.isEmpty()) {
+                    continue;
+                }
+
+                for (Message msg : messages) {
+                    logger.info("Received message: {}", msg.body());
+
+                    try {
+                        boolean success = processMessage(msg.body());
+                        if (success) {
+                            deleteMessage(msg);
+                            logger.info("Message processed and deleted.");
+                        } else {
+                            logger.warn("Message processing failed. Will retry after visibility timeout.");
+                        }
+                    } catch (Exception e) {
+                        logger.error("Error while processing message: {}", e.getMessage(), e);
+                    }
+                }
+
+            } catch (Exception e) {
+                logger.error("Error receiving messages: {}", e.getMessage(), e);
+                try {
+                    Thread.sleep(5000); // backoff on error
+                } catch (InterruptedException ignored) {}
+            }
+        }
+    }
+
+    private boolean processMessage(String body) {
+        // ---- Business logic for routing goes here ----
+        logger.info("Processing message body: {}", body);
+        try {
+            Thread.sleep(2000); // simulate work
+            return true;
+        } catch (InterruptedException e) {
+            return false;
+        }
+    }
+
+    private void deleteMessage(Message msg) {
+        DeleteMessageRequest deleteRequest = DeleteMessageRequest.builder()
+                .queueUrl(queueUrl)
+                .receiptHandle(msg.receiptHandle())
+                .build();
+        sqsClient.deleteMessage(deleteRequest);
+    }
+
+    public static void main(String[] args) {
+        String queueUrl = System.getenv("SQS_QUEUE_URL");
+        if (queueUrl == null || queueUrl.isEmpty()) {
+            throw new RuntimeException("Missing environment variable: SQS_QUEUE_URL");
+        }
+
+        RouterService service = new RouterService(queueUrl);
+        service.start();
+    }
+}
+🔹 Dockerfile for ECS
+FROM eclipse-temurin:17-jdk-jammy as builder
+WORKDIR /app
+
+COPY pom.xml .
+COPY src ./src
+
+RUN ./mvnw clean package -DskipTests
+
+FROM eclipse-temurin:17-jre-jammy
+WORKDIR /app
+
+COPY --from=builder /app/target/router-service-*.jar app.jar
+
+CMD ["java", "-jar", "app.jar"]
+🔹 ECS Service Setup
+Run multiple tasks of router-service.
+
+Each task polls SQS independently.
+
+IAM Task Role must allow:
+
+sqs:ReceiveMessage
+
+sqs:DeleteMessage
+
+sqs:GetQueueAttributes
+
+🔹 Behavior
+Multiple Router Service tasks can run → SQS ensures each message is given to only one at a time.
+
+Once-only consumption is achieved by:
+
+Proper visibilityTimeout (longer than processing time).
+
+Deleting message only after successful processing.
+
+For exactly-once → use FIFO queue with deduplication ID.
+
+Do you want me to extend this into a Spring Boot microservice (with REST + config support), or keep it as this lightweight Java ECS worker?
+
+You said:
+spring boot 
+ChatGPT said:
+Great ✅ You want the Router Service as a Spring Boot microservice that runs in ECS and consumes from SQS.
+This way you can scale the ECS service with multiple tasks, and Spring Boot will handle lifecycle, logging, and configuration nicely.
+
+🔹 Dependencies (pom.xml)
+<dependencies>
+    <!-- Spring Boot Starter -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter</artifactId>
+    </dependency>
+
+    <!-- AWS SDK v2 for SQS -->
+    <dependency>
+        <groupId>software.amazon.awssdk</groupId>
+        <artifactId>sqs</artifactId>
+        <version>2.20.120</version>
+    </dependency>
+
+    <!-- Logging -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-logging</artifactId>
+    </dependency>
+</dependencies>
+🔹 Configuration (application.yml)
+aws:
+  sqs:
+    queue-url: ${SQS_QUEUE_URL}
+    wait-time-seconds: 20
+    visibility-timeout: 30
+🔹 Router Service Consumer (RouterService.java)
+package com.example.router;
+
+import jakarta.annotation.PostConstruct;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+import software.amazon.awssdk.services.sqs.SqsClient;
+import software.amazon.awssdk.services.sqs.model.*;
+
+import java.util.List;
+
+@Service
+public class RouterService {
+
+    private static final Logger logger = LoggerFactory.getLogger(RouterService.class);
+
+    private final SqsClient sqsClient;
+    private final String queueUrl;
+
+    public RouterService(SqsClient sqsClient) {
+        this.sqsClient = sqsClient;
+        this.queueUrl = System.getenv("SQS_QUEUE_URL");
+        if (this.queueUrl == null || this.queueUrl.isEmpty()) {
+            throw new IllegalArgumentException("Missing SQS_QUEUE_URL env variable");
+        }
+    }
+
+    @PostConstruct
+    public void startConsumer() {
+        Thread thread = new Thread(this::pollMessages, "sqs-consumer-thread");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    private void pollMessages() {
+        logger.info("Starting Router Service consumer...");
+
+        while (true) {
+            try {
+                ReceiveMessageRequest receiveRequest = ReceiveMessageRequest.builder()
+                        .queueUrl(queueUrl)
+                        .maxNumberOfMessages(1)   // one at a time
+                        .waitTimeSeconds(20)      // long polling
+                        .visibilityTimeout(30)    // time to process before message reappears
+                        .build();
+
+                List<Message> messages = sqsClient.receiveMessage(receiveRequest).messages();
+
+                if (messages.isEmpty()) {
+                    continue;
+                }
+
+                for (Message msg : messages) {
+                    logger.info("Received message: {}", msg.body());
+
+                    try {
+                        boolean success = processMessage(msg.body());
+                        if (success) {
+                            deleteMessage(msg);
+                            logger.info("Message processed and deleted.");
+                        } else {
+                            logger.warn("Message processing failed. Will retry after visibility timeout.");
+                        }
+                    } catch (Exception e) {
+                        logger.error("Error while processing message: {}", e.getMessage(), e);
+                    }
+                }
+
+            } catch (Exception e) {
+                logger.error("Error receiving messages: {}", e.getMessage(), e);
+                try {
+                    Thread.sleep(5000); // backoff
+                } catch (InterruptedException ignored) {}
+            }
+        }
+    }
+
+    private boolean processMessage(String body) {
+        // ---- Business logic for routing goes here ----
+        logger.info("Processing message body: {}", body);
+        try {
+            Thread.sleep(2000); // simulate processing
+            return true;
+        } catch (InterruptedException e) {
+            return false;
+        }
+    }
+
+    private void deleteMessage(Message msg) {
+        DeleteMessageRequest deleteRequest = DeleteMessageRequest.builder()
+                .queueUrl(queueUrl)
+                .receiptHandle(msg.receiptHandle())
+                .build();
+        sqsClient.deleteMessage(deleteRequest);
+    }
+}
+🔹 AWS Client Configuration (AwsConfig.java)
+package com.example.router;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import software.amazon.awssdk.services.sqs.SqsClient;
+
+@Configuration
+public class AwsConfig {
+
+    @Bean
+    public SqsClient sqsClient() {
+        return SqsClient.create(); // region + creds picked from ECS Task Role
+    }
+}
+🔹 Spring Boot Main Application (RouterApplication.java)
+package com.example.router;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class RouterApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(RouterApplication.class, args);
+    }
+}
+🔹 ECS Setup
+Run as Fargate service (or EC2).
+
+Multiple tasks can run in parallel → each gets its own share of messages.
+
+IAM Task Role must allow:
+
+sqs:ReceiveMessage
+
+sqs:DeleteMessage
+
+sqs:GetQueueAttributes
+
+✅ This gives you a Spring Boot ECS service that continuously polls SQS, processes, and deletes messages safely.
+If a container crashes before deleteMessage, the message reappears after visibilityTimeout, so it won’t be lost.
+
+Would you like me to also add graceful shutdown hooks (so when ECS scales in, the service finishes processing in-flight messages before stopping)?
+
+You said:
+if there are multiple instances of router service , what will happen?
+ChatGPT said:
+Good question 👍 — this is exactly where SQS + ECS scaling comes into play.
+
+🔹 What happens with multiple Router Service instances?
+Multiple consumers (ECS tasks/containers) can poll the same SQS queue.
+
+Each consumer calls ReceiveMessage.
+
+SQS delivers a message to only one consumer at a time.
+
+No duplication across active consumers.
+
+If one Router Service instance gets message M1, another instance will not see M1 unless:
+
+The first instance fails to delete it, and
+
+The visibility timeout expires.
+
+Load balancing is automatic.
+
+If you run 5 Router Service tasks in ECS, and the queue has many messages, SQS will distribute messages across them.
+
+It’s not a strict round-robin, but statistically messages get spread across consumers.
+
+Message visibility ensures “at most once at a time.”
+
+When a Router Service receives a message, it becomes invisible to others for the configured visibilityTimeout.
+
+If the service finishes and calls deleteMessage, that message is gone forever.
+
+If the service crashes or times out, the message reappears after the visibility timeout, so another instance can pick it up.
+
+Scaling up or down is safe.
+
+If you scale up ECS (say from 2 → 10 instances), each instance will just join the pollers.
+
+If you scale down ECS (say 10 → 2 instances), messages already received but not deleted may reappear (after timeout) and be picked up by the remaining instances.
+
+🔹 Example Scenarios
+Scenario 1: Normal case
+3 Router Service instances are running.
+Queue has 300 messages.
+→ SQS distributes ~100 messages each (not exactly equal, but balanced).
+
+Scenario 2: Crash before delete
+Router Service A gets a message but crashes before calling deleteMessage.
+→ After visibilityTimeout, the message is re-delivered to another Router Service instance (B or C).
+
+Scenario 3: Long processing
+If processing takes longer than the visibility timeout, the message may be delivered again (duplicate).
+→ Solution: set visibilityTimeout slightly larger than the max processing time.
+
+🔹 Key Guarantees
+Standard SQS Queue:
+
+At-least-once delivery (can sometimes get duplicates).
+
+Out-of-order delivery possible.
+
+FIFO SQS Queue:
+
+Exactly-once processing (with deduplication).
+
+Ordered delivery (by message group ID).
+
+👉 So, with multiple Router Service instances in ECS, you get parallelism and safe message distribution without collisions.
+The only things to watch are:
+
+Correct visibilityTimeout
+
+Proper deleteMessage after success
+
+Idempotent processing logic (in case of duplicates).
+
+Do you want me to also show you how to make the router service idempotent (so even if SQS delivers a duplicate, your downstream logic won’t process it twice)?
+
+You said:
+show idempotency logic
+ChatGPT said:
+Perfect 👍 You’re thinking in the right direction. With SQS Standard queues, you may get duplicates, and even with FIFO queues, idempotency is still a best practice for safety.
+
+Here’s how you can add idempotency logic to your Spring Boot RouterService:
+
+🔹 Approaches to Idempotency
+Message-level deduplication
+
+Use a unique message ID (from Message.messageId() or a custom field in body).
+
+Keep track of processed IDs in a datastore (Redis, DynamoDB, RDS, etc.).
+
+Before processing, check if the ID already exists → skip if yes.
+
+Deduplication at SQS (FIFO queues only)
+
+If you send messages with a MessageDeduplicationId, SQS won’t enqueue duplicates.
+
+Still, consumers should remain idempotent since retries can happen.
+
+🔹 Example in Your Spring Boot Router Service
+package com.example.router;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+import software.amazon.awssdk.services.sqs.model.Message;
+
+import java.util.concurrent.ConcurrentHashMap;
+
+@Service
+public class IdempotentProcessor {
+
+    private static final Logger logger = LoggerFactory.getLogger(IdempotentProcessor.class);
+
+    // Simple in-memory store (works for single instance / demo).
+    // In production: use Redis, DynamoDB, or RDS.
+    private final ConcurrentHashMap<String, Boolean> processedMessageIds = new ConcurrentHashMap<>();
+
+    public boolean processMessage(Message message) {
+        String messageId = message.messageId(); // AWS SQS generated ID
+        // Alternatively, parse body JSON and use your own `eventId`
+
+        if (processedMessageIds.putIfAbsent(messageId, true) != null) {
+            logger.info("Duplicate detected, skipping messageId={}", messageId);
+            return true; // already processed
+        }
+
+        try {
+            // ---- Your business logic ----
+            logger.info("Processing unique messageId={}, body={}", messageId, message.body());
+
+            Thread.sleep(2000); // simulate work
+            return true;
+
+        } catch (Exception e) {
+            logger.error("Error processing messageId={}: {}", messageId, e.getMessage(), e);
+            processedMessageIds.remove(messageId); // allow retry if failed
+            return false;
+        }
+    }
+}
+🔹 Updated RouterService Consumer
+@Service
+public class RouterService {
+
+    private static final Logger logger = LoggerFactory.getLogger(RouterService.class);
+
+    private final SqsClient sqsClient;
+    private final String queueUrl;
+    private final IdempotentProcessor idempotentProcessor;
+
+    public RouterService(SqsClient sqsClient, IdempotentProcessor processor) {
+        this.sqsClient = sqsClient;
+        this.queueUrl = System.getenv("SQS_QUEUE_URL");
+        this.idempotentProcessor = processor;
+
+        if (this.queueUrl == null || this.queueUrl.isEmpty()) {
+            throw new IllegalArgumentException("Missing SQS_QUEUE_URL env variable");
+        }
+    }
+
+    @PostConstruct
+    public void startConsumer() {
+        Thread thread = new Thread(this::pollMessages, "sqs-consumer-thread");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    private void pollMessages() {
+        while (true) {
+            try {
+                ReceiveMessageRequest receiveRequest = ReceiveMessageRequest.builder()
+                        .queueUrl(queueUrl)
+                        .maxNumberOfMessages(1)
+                        .waitTimeSeconds(20)
+                        .visibilityTimeout(30)
+                        .build();
+
+                List<Message> messages = sqsClient.receiveMessage(receiveRequest).messages();
+
+                for (Message msg : messages) {
+                    logger.info("Received messageId={}, body={}", msg.messageId(), msg.body());
+
+                    boolean success = idempotentProcessor.processMessage(msg);
+
+                    if (success) {
+                        deleteMessage(msg);
+                    }
+                }
+
+            } catch (Exception e) {
+                logger.error("Error in consumer loop: {}", e.getMessage(), e);
+            }
+        }
+    }
+
+    private void deleteMessage(Message msg) {
+        sqsClient.deleteMessage(DeleteMessageRequest.builder()
+                .queueUrl(queueUrl)
+                .receiptHandle(msg.receiptHandle())
+                .build());
+    }
+}
+🔹 How It Works
+Each message has a unique ID (SQS auto-generates one).
+
+Before processing, the service checks if the ID was already seen.
+
+If yes → skip.
+
+If no → process + mark as seen.
+
+If processing fails → remove from “seen” so retry works.
+
+🔹 For Production
+In-memory map works only inside one ECS task.
+
+If you scale ECS tasks (multiple instances), you need shared storage:
+
+Redis (best for fast idempotency checks)
+
+DynamoDB with TTL (store message IDs for X hours/days)
+
+RDS table if you already have a relational DB
+
+👉 Do you want me to show a Redis-backed idempotency implementation (works across multiple ECS tasks), or keep this as the in-memory version?
+
+You said:
+sqs listener do we have?
+ChatGPT said:
+Good point 👍 — in Spring Boot, unlike Kafka or RabbitMQ, there is no built-in SQS listener container (like @KafkaListener or @RabbitListener).
+But you can get this capability in two ways:
+
+🔹 1. Native Spring Boot (polling loop)
+What we wrote earlier (a background polling loop with SqsClient.receiveMessage) is the native way.
+Spring Boot itself doesn’t provide @SqsListener out of the box.
+
+🔹 2. Using Spring Cloud AWS
+Spring Cloud AWS provides @SqsListener annotation, which works similar to @JmsListener.
+
+Maven Dependency
+<dependency>
+    <groupId>io.awspring.cloud</groupId>
+    <artifactId>spring-cloud-aws-starter-sqs</artifactId>
+    <version>3.0.2</version>
+</dependency>
+Example Listener
+import io.awspring.cloud.sqs.annotation.SqsListener;
+import org.springframework.stereotype.Service;
+
+@Service
+public class RouterListener {
+
+    @SqsListener("${aws.sqs.queue-name}")
+    public void listen(String message) {
+        System.out.println("Received message from SQS: " + message);
+
+        // process message
+        // idempotency logic here
+    }
+}
+🔹 How it Works
+Spring Cloud AWS sets up a background listener container.
+
+It handles long polling, visibility timeout, and concurrency for you.
+
+You just annotate a method with @SqsListener.
+
+🔹 Configuration (application.yml)
+spring:
+  cloud:
+    aws:
+      region:
+        static: ap-south-1
+      credentials:
+        instance-profile: true  # use ECS Task Role
+aws:
+  sqs:
+    queue-name: router-queue
+🔹 3. Trade-offs
+Spring Cloud AWS @SqsListener → Less code, declarative, very Spring-like.
+
+Manual SqsClient polling loop → More control (custom visibility timeout, batching, idempotency logic).
+
+✅ So, yes — you can have an @SqsListener using Spring Cloud AWS.
+If you stick with plain Spring Boot + AWS SDK, you need to write the polling loop manually.
+
+👉 Do you want me to show you a Spring Boot Router Service with @SqsListener (Spring Cloud AWS) including idempotency support, so you don’t need to manage polling yourself?
+
+You said:
+@SqsListener how this will take care of visibility timeout
+ChatGPT said:
+Excellent follow-up 👌
+
+When you use @SqsListener (Spring Cloud AWS), the framework is still doing the polling loop under the hood, and the way it handles visibility timeout is important to understand.
+
+🔹 How Visibility Timeout Works with @SqsListener
+Message is received
+
+Spring Cloud AWS uses ReceiveMessage with visibilityTimeout set (by default, whatever you configured on the SQS queue).
+
+When a message is received, it becomes invisible to other consumers for that period.
+
+Your listener method executes
+
+Example:
+
+@SqsListener("router-queue")
+public void listen(String message) {
+    // process message
+}
+Automatic delete on success
+
+By default, Spring Cloud AWS deletes the message from SQS after your listener method completes successfully.
+
+This is equivalent to calling DeleteMessage with the receipt handle.
+
+If your method throws an exception, the message is not deleted and will reappear after the visibility timeout expires.
+
+Visibility Timeout duration
+
+If your processing takes longer than the visibility timeout, SQS will make the message visible again → another consumer may pick it up (duplicate).
+
+To prevent this, you either:
+
+Set queue-level visibility timeout longer than your max processing time, or
+
+Use @SqsListener with manual acknowledgment and extend visibility dynamically (advanced).
+
+🔹 Configuring Visibility Timeout
+You set it on the queue itself (via AWS console, CLI, or Terraform/CloudFormation):
+
+aws sqs set-queue-attributes \
+  --queue-url <QUEUE_URL> \
+  --attributes VisibilityTimeout=60
+You can also configure default visibility per @SqsListener container via properties:
+
+spring:
+  cloud:
+    aws:
+      sqs:
+        listener:
+          max-messages: 5
+          wait-time: 20
+          visibility-timeout: 60
+🔹 Advanced: Extending Visibility While Processing
+Spring Cloud AWS v3 supports acknowledgment mode so you can control delete & visibility:
+
+import io.awspring.cloud.sqs.annotation.SqsListener;
+import io.awspring.cloud.sqs.listener.acknowledgement.Acknowledgement;
+
+@Service
+public class RouterListener {
+
+    @SqsListener("router-queue")
+    public void listen(String message, Acknowledgement ack) {
+        try {
+            // Long-running business logic
+            processMessage(message);
+
+            // Explicitly acknowledge (delete) after success
+            ack.acknowledge();
+        } catch (Exception e) {
+            // Don't acknowledge -> message will reappear after visibility timeout
+            throw e;
+        }
+    }
+
+    private void processMessage(String msg) throws InterruptedException {
+        Thread.sleep(50000); // simulate long processing
+    }
+}
+In this mode, you could also call the AWS SDK to extend visibility if you know processing will take longer than expected.
+
+🔹 Summary
+@SqsListener relies on SQS visibility timeout just like a manual poller.
+
+On success → deletes message.
+
+On failure → message reappears after visibility timeout.
+
+If processing may exceed visibility timeout → you must increase it or use manual ack with visibility extension.
+
+👉 Do you want me to show you how to implement dynamic visibility extension (heartbeat style) inside a Spring @SqsListener for very long-running jobs?
+
+You said:
+idempotency processor will not if there are multiple instances of router service , Right?
+ChatGPT said:
+Exactly ✅ you’ve spotted the key issue.
+
+The in-memory idempotency processor I showed earlier (ConcurrentHashMap inside one ECS task) only works inside a single Router Service instance.
+
+If you scale ECS to multiple tasks (say 5 containers), each one has its own JVM, so:
+
+Instance A processes message M1 → stores it in its in-memory map.
+
+Instance B also receives duplicate M1 (maybe because A crashed before delete, or SQS redelivered after visibility timeout) → B doesn’t know about A’s processed IDs → it will process again.
+
+So yes, idempotency is lost across multiple instances unless you use a shared store.
+
+🔹 How to Make Idempotency Work Across Instances
+You need a distributed datastore that all Router Service tasks can check before processing.
+
+Common Approaches:
+DynamoDB (Recommended AWS-native)
+
+Store message IDs (e.g., messageId or business eventId) in a DynamoDB table.
+
+Use a conditional write:
+
+PutItem if attribute_not_exists(messageId)
+If insert succeeds → first processor wins.
+
+If insert fails → message already processed → skip.
+
+Add TTL to auto-expire entries after a few days to save storage.
+
+Redis (ElastiCache in AWS)
+
+Store messageId with TTL (e.g., 24h).
+
+Use SETNX (set if not exists) → ensures only one service processes it.
+
+RDS / Aurora
+
+Store processed IDs in a DB table with primary key = messageId.
+
+First insert succeeds, duplicates fail.
+
+More overhead compared to DynamoDB/Redis.
+
+🔹 Example with DynamoDB
+Table: ProcessedMessages
+Partition key: messageId (string)
+
+TTL attribute: expireAt (timestamp, e.g., now + 7 days)
+
+Java Code
+import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
+import software.amazon.awssdk.services.dynamodb.model.*;
+
+import java.time.Instant;
+import java.util.HashMap;
+import java.util.Map;
+
+public class IdempotencyStore {
+
+    private final DynamoDbClient dynamoDb;
+    private final String tableName = "ProcessedMessages";
+
+    public IdempotencyStore(DynamoDbClient dynamoDb) {
+        this.dynamoDb = dynamoDb;
+    }
+
+    public boolean isFirstProcess(String messageId) {
+        Map<String, AttributeValue> item = new HashMap<>();
+        item.put("messageId", AttributeValue.builder().s(messageId).build());
+        item.put("expireAt", AttributeValue.builder()
+                .n(String.valueOf(Instant.now().getEpochSecond() + 86400)) // expire after 1 day
+                .build());
+
+        try {
+            dynamoDb.putItem(PutItemRequest.builder()
+                    .tableName(tableName)
+                    .item(item)
+                    .conditionExpression("attribute_not_exists(messageId)")
+                    .build());
+            return true; // success, first processor
+        } catch (ConditionalCheckFailedException e) {
+            return false; // duplicate
+        }
+    }
+}
+Usage in @SqsListener:
+
+@SqsListener("router-queue")
+public void listen(Message message) {
+    String messageId = message.messageId(); // or custom eventId from body
+    if (!idempotencyStore.isFirstProcess(messageId)) {
+        log.info("Skipping duplicate message {}", messageId);
+        return;
+    }
+
+    processMessage(message.body());
+}
+✅ So, you’re right — the in-memory solution won’t work across ECS tasks.
+For production, the best choice in AWS is usually DynamoDB with TTL because it’s serverless, highly available, and cheap.
+
+Do you want me to show a Spring Boot DynamoDB-based IdempotencyProcessor (so your router service instances can safely share state)?
+
+You said:
+we are using mongodb
+ChatGPT said:
+Perfect 👍 If your system already uses MongoDB, you can use it as the idempotency store instead of DynamoDB/Redis.
+MongoDB is a great fit because inserts with a unique index give you exactly the “process once” guarantee you need across multiple ECS Router Service instances.
+
+🔹 MongoDB Idempotency Strategy
+Create a collection processed_messages.
+
+Use a unique index on messageId.
+
+When processing a message:
+
+Try to insert { messageId, processedAt, expireAt }.
+
+If insert succeeds → first consumer → process.
+
+If insert fails (duplicate key) → message already processed → skip.
+
+Use a TTL index on expireAt to auto-delete old entries.
+
+🔹 MongoDB Collection Setup
+db.processed_messages.createIndex(
+  { "messageId": 1 },
+  { unique: true }
+);
+
+db.processed_messages.createIndex(
+  { "expireAt": 1 },
+  { expireAfterSeconds: 0 }
+);
+This means:
+
+Each messageId can exist only once.
+
+Docs expire automatically after expireAt.
+
+🔹 Spring Boot IdempotencyProcessor (MongoDB)
+package com.example.router;
+
+import com.mongodb.MongoWriteException;
+import org.bson.Document;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.stereotype.Component;
+
+import java.time.Instant;
+import java.util.Date;
+
+@Component
+public class IdempotencyProcessor {
+
+    private final MongoTemplate mongoTemplate;
+
+    public IdempotencyProcessor(MongoTemplate mongoTemplate) {
+        this.mongoTemplate = mongoTemplate;
+    }
+
+    /**
+     * Returns true if message should be processed (first time),
+     * false if it's a duplicate.
+     */
+    public boolean isFirstProcess(String messageId) {
+        try {
+            Document doc = new Document()
+                    .append("messageId", messageId)
+                    .append("processedAt", new Date())
+                    .append("expireAt", Date.from(Instant.now().plusSeconds(86400))); // expire after 1 day
+
+            mongoTemplate.getCollection("processed_messages").insertOne(doc);
+            return true; // insert succeeded → first processor
+        } catch (MongoWriteException e) {
+            if (e.getError().getCategory().equals(com.mongodb.ErrorCategory.DUPLICATE_KEY)) {
+                return false; // duplicate
+            }
+            throw e; // rethrow unexpected errors
+        }
+    }
+}
+🔹 Usage in @SqsListener
+import io.awspring.cloud.sqs.annotation.SqsListener;
+import org.springframework.stereotype.Service;
+
+@Service
+public class RouterListener {
+
+    private final IdempotencyProcessor idempotencyProcessor;
+
+    public RouterListener(IdempotencyProcessor processor) {
+        this.idempotencyProcessor = processor;
+    }
+
+    @SqsListener("router-queue")
+    public void listen(String message) {
+        String messageId = extractMessageId(message); // parse from body or use SQS messageId
+
+        if (!idempotencyProcessor.isFirstProcess(messageId)) {
+            System.out.println("Skipping duplicate messageId=" + messageId);
+            return;
+        }
+
+        System.out.println("Processing unique messageId=" + messageId + ", body=" + message);
+        // business logic here...
+    }
+
+    private String extractMessageId(String message) {
+        // If your payload has its own unique ID, extract that
+        // Otherwise use SQS messageId (not in body, so you'd need `Message` object instead of String)
+        return String.valueOf(message.hashCode()); // placeholder
+    }
+}
+🔹 Why This Works
+Works across all ECS Router Service instances (because they all use the same MongoDB cluster).
+
+Guarantees first writer wins because of the unique index.
+
+Prevents duplicates, even if SQS redelivers the same message after visibility timeout.
+
+Old entries auto-cleaned with TTL index.
+
+👉 Do you want me to adapt this so that your @SqsListener method gets the full Message object (with AWS messageId), instead of just the body string? That way you don’t need to embed your own ID in the payload.
+
+You said:
+yes
+ChatGPT said:
+Perfect 👍 then instead of binding @SqsListener to just the String body, you can bind it to the full AWS SDK Message object. That gives you direct access to the SQS-provided messageId (which is guaranteed unique per queue).
+
+🔹 Updated Listener with Full Message Object
+import io.awspring.cloud.sqs.annotation.SqsListener;
+import org.springframework.stereotype.Service;
+import software.amazon.awssdk.services.sqs.model.Message;
+
+@Service
+public class RouterListener {
+
+    private final IdempotencyProcessor idempotencyProcessor;
+
+    public RouterListener(IdempotencyProcessor processor) {
+        this.idempotencyProcessor = processor;
+    }
+
+    @SqsListener("router-queue")
+    public void listen(Message message) {
+        String messageId = message.messageId();  // AWS SQS-generated unique ID
+        String body = message.body();
+
+        if (!idempotencyProcessor.isFirstProcess(messageId)) {
+            System.out.println("Skipping duplicate messageId=" + messageId);
+            return;
+        }
+
+        System.out.println("Processing unique messageId=" + messageId + ", body=" + body);
+        // ✅ your business logic goes here
+    }
+}
+🔹 MongoDB Idempotency Processor (same as before)
+import com.mongodb.MongoWriteException;
+import org.bson.Document;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.stereotype.Component;
+
+import java.time.Instant;
+import java.util.Date;
+
+@Component
+public class IdempotencyProcessor {
+
+    private final MongoTemplate mongoTemplate;
+
+    public IdempotencyProcessor(MongoTemplate mongoTemplate) {
+        this.mongoTemplate = mongoTemplate;
+    }
+
+    public boolean isFirstProcess(String messageId) {
+        try {
+            Document doc = new Document()
+                    .append("messageId", messageId)
+                    .append("processedAt", new Date())
+                    .append("expireAt", Date.from(Instant.now().plusSeconds(86400))); // 1 day retention
+
+            mongoTemplate.getCollection("processed_messages").insertOne(doc);
+            return true; // first time
+        } catch (MongoWriteException e) {
+            if (e.getError().getCategory().equals(com.mongodb.ErrorCategory.DUPLICATE_KEY)) {
+                return false; // duplicate
+            }
+            throw e;
+        }
+    }
+}
+🔹 MongoDB Setup
+Run these once in Mongo shell:
+
+db.processed_messages.createIndex(
+  { "messageId": 1 },
+  { unique: true }
+);
+
+db.processed_messages.createIndex(
+  { "expireAt": 1 },
+  { expireAfterSeconds: 0 }
+);
+✅ Now:
+
+Multiple ECS instances of Router Service can consume in parallel.
+
+Even if SQS retries/redelivers, only the first insert wins.
+
+Other instances will skip duplicates.
+
+Old entries expire automatically.
+
+Do you also want me to show you how to acknowledge/delete messages only after successful processing, so they don’t reappear if your service crashes mid-way?
+
+You said:
+yes
+ChatGPT said:
+Great question 👌
+
+By default, when you use @SqsListener in Spring Cloud AWS, the framework automatically deletes the message from SQS once your listener method returns successfully.
+
+👉 If your code throws an exception, the message is NOT deleted, and after the visibility timeout expires, SQS will redeliver it to any instance of your Router Service.
+
+That’s why you should combine idempotency (Mongo) + acknowledge on success only.
+
+🔹 Default Behavior with @SqsListener
+Success → Spring deletes message.
+
+Exception → Message stays, becomes visible again after timeout → retried (possibly by another ECS task).
+
+After max retries (configured in DLQ redrive policy), the message goes to a Dead Letter Queue.
+
+So you already get “delete after success” semantics ✅
+
+🔹 Explicit Control (Optional)
+If you want manual ack/deletion (instead of auto), you can inject Acknowledgement into your listener.
+
+import io.awspring.cloud.sqs.annotation.SqsListener;
+import io.awspring.cloud.sqs.listener.acknowledgement.Acknowledgement;
+import org.springframework.stereotype.Service;
+import software.amazon.awssdk.services.sqs.model.Message;
+
+@Service
+public class RouterListener {
+
+    private final IdempotencyProcessor idempotencyProcessor;
+
+    public RouterListener(IdempotencyProcessor processor) {
+        this.idempotencyProcessor = processor;
+    }
+
+    @SqsListener("router-queue")
+    public void listen(Message message, Acknowledgement ack) {
+        String messageId = message.messageId();
+        String body = message.body();
+
+        try {
+            if (!idempotencyProcessor.isFirstProcess(messageId)) {
+                System.out.println("Skipping duplicate messageId=" + messageId);
+                ack.acknowledge(); // delete even duplicates
+                return;
+            }
+
+            System.out.println("Processing unique messageId=" + messageId + ", body=" + body);
+
+            // ✅ Business logic here
+
+            ack.acknowledge(); // delete only if success
+        } catch (Exception e) {
+            // ❌ no ack, message will reappear after visibility timeout
+            System.err.println("Failed to process messageId=" + messageId + ": " + e.getMessage());
+        }
+    }
+}
+🔹 Flow Now
+Router Service receives message.
+
+Checks idempotency in Mongo.
+
+First time → processes → acknowledges → message deleted from SQS.
+
+Duplicate → acknowledges immediately → deleted.
+
+If processing fails → no ack → message becomes visible after visibility timeout → retried.
+
+If keeps failing → goes to DLQ (if configured).
+
+✅ This way:
+
+No message is lost.
+
+No duplicate processing.
+
+Retries + DLQ handling are automatic.
+
+Do you also want me to add Spring Boot YAML configs for setting visibility timeout + DLQ redrive policy for the queue?
+
+You said:
+yes
+ChatGPT said:
+Perfect 👍 let’s make this production-ready with Spring Boot YAML configs + AWS setup for SQS queue, visibility timeout, and DLQ redrive policy.
+
+🔹 1. application.yml for Spring Boot (SQS config)
+spring:
+  application:
+    name: router-service
+
+  cloud:
+    aws:
+      region:
+        static: ap-south-1   # your AWS region
+      credentials:
+        access-key: YOUR_AWS_ACCESS_KEY
+        secret-key: YOUR_AWS_SECRET_KEY
+      sqs:
+        listener:
+          # controls how many messages are polled in one batch
+          max-messages: 10
+          # long polling (reduces empty receives)
+          wait-time: 20s
+          # concurrency (how many threads per instance)
+          concurrency: 5
+👉 Notes:
+
+max-messages → how many messages per poll (SQS max = 10).
+
+wait-time → enables long polling.
+
+concurrency → how many parallel listeners inside one ECS container.
+
+🔹 2. SQS Queue Setup (with DLQ)
+You need two queues:
+
+Main queue: router-queue
+
+DLQ: router-queue-dlq
+
+You can create them via AWS Console, AWS CLI, or Terraform.
+
+AWS CLI example:
+# Create DLQ
+aws sqs create-queue --queue-name router-queue-dlq
+
+# Create Main Queue with DLQ redrive policy
+aws sqs create-queue --queue-name router-queue \
+  --attributes '{
+    "VisibilityTimeout":"60", 
+    "RedrivePolicy":"{\"deadLetterTargetArn\":\"arn:aws:sqs:ap-south-1:123456789012:router-queue-dlq\",\"maxReceiveCount\":\"5\"}"
+  }'
+Explanation:
+VisibilityTimeout = 60 seconds → while a consumer is working, other consumers won’t see the message for 60s.
+
+RedrivePolicy →
+
+deadLetterTargetArn = DLQ ARN
+
+maxReceiveCount = 5 → after 5 retries, message goes to DLQ.
+
+🔹 3. Putting it All Together
+✔️ Processing Flow:
+
+Message arrives in router-queue.
+
+Router Service ECS task picks it up.
+
+If processing succeeds → ACK → deleted.
+
+If fails → not ACKed → reappears after VisibilityTimeout.
+
+If fails 5 times → sent to router-queue-dlq.
+
+DLQ can be monitored (CloudWatch alarm / Lambda DLQ handler).
+
+🔹 4. Optional: Override Visibility Timeout per Message
+If some messages take longer than 60s to process, you can dynamically extend visibility timeout using the AWS SDK inside your listener:
+
+sqsClient.changeMessageVisibility(ChangeMessageVisibilityRequest.builder()
+    .queueUrl(queueUrl)
+    .receiptHandle(message.receiptHandle())
+    .visibilityTimeout(300) // 5 minutes
+    .build());
+✅ Now you have:
+
+application.yml tuning listener concurrency.
+
+Main + DLQ setup with retries.
+
+Default visibility timeout handling.
+
+Option to extend visibility timeout for long jobs.
+
+Do you want me to also give you a Terraform script for creating the main + DLQ queues (instead of CLI), so you can version-control your infra?
+
+You said:
+no need to write code?
+ChatGPT said:
+Exactly 👍
+
+If you go with Spring Cloud AWS + @SqsListener, then:
+
+No custom polling code is needed.
+
+Spring Cloud AWS handles:
+
+polling SQS with long polling,
+
+managing visibility timeout (default = whatever you set on the queue),
+
+deleting the message only if your listener completes successfully.
+
+You only write your business logic inside the listener method:
+
+@Service
+public class RouterListener {
+
+    private final IdempotencyService idempotencyService;
+
+    public RouterListener(IdempotencyService idempotencyService) {
+        this.idempotencyService = idempotencyService;
+    }
+
+    @SqsListener("${aws.sqs.queue-name}")
+    public void listen(String message) {
+        if (idempotencyService.isDuplicate(message)) {
+            return; // already processed
+        }
+
+        try {
+            // ✅ business logic
+            System.out.println("Processing message: " + message);
+
+            idempotencyService.markProcessed(message);
+
+        } catch (Exception ex) {
+            // ❌ throw to let Spring handle retry / DLQ
+            throw ex;
+        }
+    }
+}
+So:
+
+SQS queue settings (visibility timeout, DLQ) → configured in AWS (not in code).
+
+Listener concurrency, batch size, wait time → configured in application.yml.
+
+Message processing + idempotency → in your service code.
+
+That’s it. ✅
+
+👉 Do you want me to draw a diagram of the message lifecycle (SQS → Router Service → Mongo → DLQ) so your team can clearly see where retries, visibility timeout, and idempotency fit?
+
+You said:
+how to process dlq
+ChatGPT said:
+Great question 👌 — processing the DLQ (Dead Letter Queue) is critical, otherwise “poison” messages just pile up.
+
+There are 3 common approaches to handle router-queue-dlq:
+
+🔹 1. Manual Inspection (one-off debugging)
+Use AWS Console → open DLQ → view messages → copy to clipboard → analyze.
+
+Good for debugging why a message repeatedly failed.
+
+# Get one DLQ message
+aws sqs receive-message --queue-url https://sqs.ap-south-1.amazonaws.com/123456789012/router-queue-dlq
+🔹 2. Automated DLQ Consumer (Spring Boot service)
+Run another ECS service (e.g. dlq-processor-service) that listens on the DLQ:
+
+@Service
+public class DlqProcessor {
+
+    @SqsListener("${aws.sqs.dlq-name}")
+    public void listenDlq(String message) {
+        // ✅ log + persist for debugging
+        System.err.println("DLQ Message received: " + message);
+
+        // Option 1: store in Mongo for analysis
+        // Option 2: trigger alert / notification
+        // Option 3: attempt re-processing (careful!)
+    }
+}
+👉 Benefits:
+
+Keeps a record in Mongo/Elasticsearch of all failed messages.
+
+Can alert team via email/SNS/Slack when DLQ grows.
+
+🔹 3. Redrive Messages (Replay DLQ → Main Queue)
+Sometimes failures were transient (bug fixed, dependency restored). You can redrive messages back from DLQ to main queue:
+
+AWS Console:
+Select DLQ → Start DLQ Redrive → choose main queue.
+
+AWS CLI:
+# Move DLQ message back to main queue
+MSG=$(aws sqs receive-message --queue-url https://sqs.../router-queue-dlq --max-number-of-messages 1)
+
+HANDLE=$(echo $MSG | jq -r '.Messages[0].ReceiptHandle')
+BODY=$(echo $MSG | jq -r '.Messages[0].Body')
+
+aws sqs send-message \
+  --queue-url https://sqs.../router-queue \
+  --message-body "$BODY"
+
+aws sqs delete-message \
+  --queue-url https://sqs.../router-queue-dlq \
+  --receipt-handle "$HANDLE"
+⚠️ Caution: Don’t blindly replay — make sure the bug that caused failure is fixed, otherwise you’ll loop endlessly.
+
+🔹 4. Monitoring DLQ
+Set up a CloudWatch Alarm on ApproximateNumberOfMessagesVisible metric for DLQ.
+
+If DLQ count > 0 for > 5 minutes → trigger SNS → email/Slack alert.
+
+✅ So typically teams do both:
+
+Auto-log DLQ messages (Mongo + alert).
+
+Manual redrive when safe.
+
+Do you want me to show you a Spring Boot DLQ processor that automatically logs DLQ messages into Mongo with a retry count, so you have a searchable history of all failed events?
+
+You said:
+how to write unit test cases
+ChatGPT said:
+Perfect 👌 let’s make this practical.
+Suppose you have a RouterListener with idempotency and a DlqProcessor for DLQ.
+We’ll write unit tests in Spring Boot with JUnit 5 and Mockito.
+
+🔹 Example Classes to Test
+@Service
+public class RouterListener {
+
+    private final IdempotencyService idempotencyService;
+
+    public RouterListener(IdempotencyService idempotencyService) {
+        this.idempotencyService = idempotencyService;
+    }
+
+    @SqsListener("${aws.sqs.queue-name}")
+    public void listen(String message) {
+        if (idempotencyService.isDuplicate(message)) {
+            return; // already processed
+        }
+
+        try {
+            // Business logic
+            System.out.println("Processing: " + message);
+            idempotencyService.markProcessed(message);
+
+        } catch (Exception e) {
+            throw e; // Let framework retry / DLQ
+        }
+    }
+}
+@Service
+public class DlqProcessor {
+
+    private final FailedMessageRepository repository;
+
+    public DlqProcessor(FailedMessageRepository repository) {
+        this.repository = repository;
+    }
+
+    @SqsListener("${aws.sqs.dlq-name}")
+    public void listenDlq(String message) {
+        repository.save(new FailedMessage(message, Instant.now()));
+    }
+}
+🔹 Unit Test for RouterListener
+@ExtendWith(MockitoExtension.class)
+class RouterListenerTest {
+
+    @Mock
+    private IdempotencyService idempotencyService;
+
+    private RouterListener listener;
+
+    @BeforeEach
+    void setUp() {
+        listener = new RouterListener(idempotencyService);
+    }
+
+    @Test
+    void shouldProcessMessage_WhenNotDuplicate() {
+        // given
+        String message = "test-msg";
+        when(idempotencyService.isDuplicate(message)).thenReturn(false);
+
+        // when
+        listener.listen(message);
+
+        // then
+        verify(idempotencyService).markProcessed(message);
+    }
+
+    @Test
+    void shouldSkipProcessing_WhenDuplicate() {
+        // given
+        String message = "dup-msg";
+        when(idempotencyService.isDuplicate(message)).thenReturn(true);
+
+        // when
+        listener.listen(message);
+
+        // then
+        verify(idempotencyService, never()).markProcessed(any());
+    }
+
+    @Test
+    void shouldThrowException_WhenProcessingFails() {
+        // given
+        String message = "fail-msg";
+        when(idempotencyService.isDuplicate(message)).thenReturn(false);
+        doThrow(new RuntimeException("boom"))
+                .when(idempotencyService).markProcessed(message);
+
+        // when / then
+        assertThrows(RuntimeException.class, () -> listener.listen(message));
+    }
+}
+🔹 Unit Test for DLQ Processor
+@ExtendWith(MockitoExtension.class)
+class DlqProcessorTest {
+
+    @Mock
+    private FailedMessageRepository repository;
+
+    private DlqProcessor dlqProcessor;
+
+    @BeforeEach
+    void setUp() {
+        dlqProcessor = new DlqProcessor(repository);
+    }
+
+    @Test
+    void shouldSaveMessageToRepository() {
+        // given
+        String dlqMessage = "dlq-msg";
+
+        // when
+        dlqProcessor.listenDlq(dlqMessage);
+
+        // then
+        verify(repository).save(argThat(fm ->
+            fm.getMessage().equals(dlqMessage)
+        ));
+    }
+}
+🔹 Key Points
+We don’t need a real SQS for unit tests → just test the business logic.
+
+Use @Mock for Mongo repositories or idempotency service.
+
+Use assertThrows, verify, never to validate expected behavior.
+
+For integration tests, you can spin up LocalStack to mock SQS.
+
+👉 Do you want me to also show you how to write an integration test with LocalStack + Testcontainers, so you can simulate real SQS and verify message consumption end-to-end?
+
+You said:
+how to unit test business logic
+ChatGPT said:
+Got it 👍 — let’s zoom in on business logic unit tests, because you don’t want to pull in SQS, Mongo, or AWS infra for these.
+
+The idea is:
+
+Keep your listener thin → only delegate to a RouterService.
+
+Write unit tests for RouterService → just pure Java logic with mocks.
+
+🔹 Example Refactor (Good Practice)
+Instead of doing business logic inside @SqsListener, we separate it:
+
+@Service
+public class RouterService {
+
+    private final IdempotencyService idempotencyService;
+
+    public RouterService(IdempotencyService idempotencyService) {
+        this.idempotencyService = idempotencyService;
+    }
+
+    public void processMessage(String message) {
+        if (idempotencyService.isDuplicate(message)) {
+            return; // ignore duplicate
+        }
+
+        // 👉 your core business logic
+        if (message.contains("ERROR")) {
+            throw new IllegalStateException("Bad message: " + message);
+        }
+
+        System.out.println("Business logic executed for: " + message);
+
+        idempotencyService.markProcessed(message);
+    }
+}
+Listener becomes thin:
+
+@Service
+public class RouterListener {
+
+    private final RouterService routerService;
+
+    public RouterListener(RouterService routerService) {
+        this.routerService = routerService;
+    }
+
+    @SqsListener("${aws.sqs.queue-name}")
+    public void listen(String message) {
+        routerService.processMessage(message);
+    }
+}
+🔹 Unit Test for Business Logic (RouterService)
+Here we only test business logic — no Spring, no SQS:
+
+@ExtendWith(MockitoExtension.class)
+class RouterServiceTest {
+
+    @Mock
+    private IdempotencyService idempotencyService;
+
+    private RouterService routerService;
+
+    @BeforeEach
+    void setUp() {
+        routerService = new RouterService(idempotencyService);
+    }
+
+    @Test
+    void shouldProcessMessage_WhenNotDuplicate() {
+        String message = "valid-msg";
+        when(idempotencyService.isDuplicate(message)).thenReturn(false);
+
+        routerService.processMessage(message);
+
+        verify(idempotencyService).markProcessed(message);
+    }
+
+    @Test
+    void shouldSkipDuplicateMessage() {
+        String message = "dup-msg";
+        when(idempotencyService.isDuplicate(message)).thenReturn(true);
+
+        routerService.processMessage(message);
+
+        verify(idempotencyService, never()).markProcessed(any());
+    }
+
+    @Test
+    void shouldThrowException_ForInvalidMessage() {
+        String message = "ERROR-message";
+        when(idempotencyService.isDuplicate(message)).thenReturn(false);
+
+        assertThrows(IllegalStateException.class,
+                () -> routerService.processMessage(message));
+
+        verify(idempotencyService, never()).markProcessed(any());
+    }
+}
+🔹 Why This Way?
+RouterListener → thin, not worth unit testing beyond a “delegates to service” check.
+
+RouterService → where the business rules live, so write tests here.
+
+Mocks → used for Mongo/Idempotency service to keep test pure.
+
+👉 Do you want me to also show you how to mock MongoDB repository in unit tests for idempotency service, so you can test dedupe logic as part of your business rules?
+
+You said:
+integration test?
+ChatGPT said:
+Great question 👌 — unit tests cover your business logic in isolation, but you’ll also want integration tests to verify that:
+
+@SqsListener really picks up messages.
+
+Your idempotency logic works end-to-end with MongoDB.
+
+SQS visibility timeout + DLQ configs behave as expected (optional, if you spin up LocalStack).
+
+🔹 Types of Integration Tests
+1. Spring Boot Integration Test (without SQS)
+Boot your Spring context with embedded MongoDB (using flapdoodle).
+
+Call your RouterService and RouterListener as beans.
+
+Verifies real Spring wiring + Mongo persistence.
+
+@SpringBootTest
+@ActiveProfiles("test")
+class RouterIntegrationTest {
+
+    @Autowired
+    private RouterService routerService;
+
+    @Autowired
+    private IdempotencyRepository idempotencyRepository;
+
+    @Test
+    void shouldPersistProcessedMessage_InMongo() {
+        String message = "msg-123";
+
+        routerService.processMessage(message);
+
+        boolean exists = idempotencyRepository.existsByMessageId("msg-123");
+        assertTrue(exists);
+    }
+}
+👉 This ensures Mongo persistence + business logic works together.
+
+2. LocalStack Integration Test (with SQS)
+If you want to test end-to-end with SQS + Mongo:
+
+Use Testcontainers (or LocalStack) to spin up SQS and Mongo.
+
+Spring Cloud AWS will connect to LocalStack instead of real AWS.
+
+Push messages into the test SQS queue, assert they’re processed and persisted in Mongo.
+
+@Testcontainers
+@SpringBootTest
+@ActiveProfiles("test")
+class RouterSqsIntegrationTest {
+
+    @Container
+    static LocalStackContainer localstack = new LocalStackContainer(DockerImageName.parse("localstack/localstack:latest"))
+            .withServices(LocalStackContainer.Service.SQS);
+
+    @Autowired
+    private AmazonSQSAsync amazonSQS;
+
+    @Autowired
+    private IdempotencyRepository idempotencyRepository;
+
+    private String queueUrl;
+
+    @BeforeEach
+    void setUp() {
+        queueUrl = amazonSQS.createQueue("test-queue").getQueueUrl();
+    }
+
+    @Test
+    void shouldConsumeMessageFromSqs_AndPersistInMongo() throws Exception {
+        // Send message
+        amazonSQS.sendMessage(queueUrl, "integration-msg-1");
+
+        // Wait a bit for listener to consume
+        Thread.sleep(2000);
+
+        // Assert processed
+        boolean exists = idempotencyRepository.existsByMessageId("integration-msg-1");
+        assertTrue(exists);
+    }
+}
+🔹 Summary
+Unit test → isolate business logic (RouterService), mock Mongo + idempotency.
+
+Spring Boot integration test → use embedded Mongo, call service, check persistence.
+
+End-to-end test → spin up LocalStack (SQS) + embedded Mongo → assert full flow works.
+
+👉 Do you want me to show you how to wire LocalStack in application-test.yml so your @SqsListener automatically points to LocalStack during integration tests?
+
+You said:
+in memory sqs?
+ChatGPT said:
+Good catch 👍 — unlike MongoDB (where we have Flapdoodle embedded), there is no official "in-memory SQS" implementation.
+But you have a few options for local / integration testing:
+
+🔹 Options for "in-memory SQS"
+1. LocalStack (recommended)
+Runs a Docker container emulating SQS, SNS, S3, DynamoDB, etc.
+
+Works with AWS SDK / Spring Cloud AWS out of the box.
+
+You can spin it up with Testcontainers for JUnit tests, so it feels "in-memory" because the container lifecycle is tied to the test.
+
+✅ Realistic behavior
+❌ Needs Docker
+
+2. ElasticMQ (lightweight)
+A standalone SQS-compatible message queue written in Scala (from the Akka team).
+
+Can run as a JAR or Docker container.
+
+Lighter than LocalStack, but only supports SQS (no SNS/S3).
+
+✅ Lightweight & fast
+❌ Not maintained as actively as LocalStack
+
+3. Mock SQS (in-memory fake using libraries)
+Some libraries exist that implement in-memory mocks of AWS SQS (e.g., mock-sqs was attempted).
+
+But for Java + Spring Boot, you usually don’t find a maintained "in-memory SQS" like you do for MongoDB or Kafka.
+
+Instead, you mock the AmazonSQSAsync bean using @MockBean in your test and verify interactions.
+
+✅ Super fast
+❌ Not true integration (doesn’t test listener/queue behavior)
+
+🔹 Typical Strategy in Spring Boot
+Most teams do this:
+
+Unit tests → mock SQS client (AmazonSQSAsync), test business logic.
+
+Integration tests → use LocalStack via Testcontainers (preferred) or ElasticMQ.
+
+Prod → real SQS.
+
+Example: LocalStack + Spring Boot Test
+@Testcontainers
+@SpringBootTest
+class SqsIntegrationTest {
+
+    @Container
+    static LocalStackContainer localstack = new LocalStackContainer("localstack/localstack:latest")
+            .withServices(LocalStackContainer.Service.SQS);
+
+    @DynamicPropertySource
+    static void configure(DynamicPropertyRegistry registry) {
+        registry.add("cloud.aws.sqs.endpoint") 
+                -> () -> localstack.getEndpointOverride(LocalStackContainer.Service.SQS).toString();
+        registry.add("cloud.aws.region.static", localstack::getRegion);
+        registry.add("cloud.aws.credentials.access-key", localstack::getAccessKey);
+        registry.add("cloud.aws.credentials.secret-key", localstack::getSecretKey);
+    }
+
+    @Autowired
+    private AmazonSQSAsync amazonSQS;
+
+    @Test
+    void shouldSendAndReceiveMessage() {
+        String queueUrl = amazonSQS.createQueue("test-queue").getQueueUrl();
+        amazonSQS.sendMessage(queueUrl, "hello-world");
+
+        List<Message> messages = amazonSQS.receiveMessage(queueUrl).getMessages();
+        assertFalse(messages.isEmpty());
+        assertEquals("hello-world", messages.get(0).getBody());
+    }
+}
+👉 So the short answer: there is no true “in-memory SQS” like H2 or embedded Mongo. The practical alternative is LocalStack (via Testcontainers) or ElasticMQ.
+
+Do you want me to show you how to plug LocalStack into your @SqsListener tests, so your consumer runs exactly as it would in ECS?
+
+You said:
+show final code with unit testing
+ChatGPT said:
+Perfect 👌 Let’s put everything together:
+
+We’ll create a Spring Boot Router Service that:
+
+Listens to SQS using @SqsListener
+
+Implements idempotency with MongoDB
+
+Has unit tests for business logic (mocking SQS/Mongo)
+
+Has integration tests with LocalStack (real SQS queue)
+
+📌 1. Application Code
+RouterListener.java
+package com.example.router;
+
+import org.springframework.stereotype.Service;
+import org.springframework.messaging.handler.annotation.Payload;
+import io.awspring.cloud.sqs.annotation.SqsListener;
+
+@Service
+public class RouterListener {
+
+    private final IdempotencyService idempotencyService;
+    private final BusinessService businessService;
+
+    public RouterListener(IdempotencyService idempotencyService, BusinessService businessService) {
+        this.idempotencyService = idempotencyService;
+        this.businessService = businessService;
+    }
+
+    @SqsListener("${app.sqs.queue-name}")
+    public void listen(@Payload String message) {
+        if (idempotencyService.isDuplicate(message)) {
+            return; // already processed
+        }
+
+        try {
+            businessService.processMessage(message);
+            idempotencyService.markProcessed(message);
+        } catch (Exception ex) {
+            throw ex; // message will reappear after visibility timeout
+        }
+    }
+}
+BusinessService.java
+package com.example.router;
+
+import org.springframework.stereotype.Service;
+
+@Service
+public class BusinessService {
+
+    public void processMessage(String message) {
+        // 🔹 Put your business logic here
+        System.out.println("Processing message: " + message);
+    }
+}
+IdempotencyService.java
+package com.example.router;
+
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.stereotype.Service;
+import org.bson.Document;
+
+@Service
+public class IdempotencyService {
+
+    private final MongoTemplate mongoTemplate;
+
+    public IdempotencyService(MongoTemplate mongoTemplate) {
+        this.mongoTemplate = mongoTemplate;
+    }
+
+    public boolean isDuplicate(String messageId) {
+        return mongoTemplate.findById(messageId, Document.class, "processedMessages") != null;
+    }
+
+    public void markProcessed(String messageId) {
+        Document doc = new Document("_id", messageId)
+                .append("processedAt", System.currentTimeMillis());
+        mongoTemplate.save(doc, "processedMessages");
+    }
+}
+application.yml
+spring:
+  data:
+    mongodb:
+      uri: mongodb://localhost:27017/routerdb
+
+app:
+  sqs:
+    queue-name: router-queue
+📌 2. Unit Tests
+BusinessServiceTest.java
+package com.example.router;
+
+import org.junit.jupiter.api.Test;
+import static org.mockito.Mockito.*;
+
+class BusinessServiceTest {
+
+    @Test
+    void shouldProcessMessage() {
+        BusinessService service = new BusinessService();
+
+        service.processMessage("hello");
+
+        // Here you would assert side effects
+        // For demo, just making sure no exception
+    }
+}
+RouterListenerTest.java
+package com.example.router;
+
+import org.junit.jupiter.api.Test;
+import static org.mockito.Mockito.*;
+
+class RouterListenerTest {
+
+    @Test
+    void shouldProcessMessageWhenNotDuplicate() {
+        IdempotencyService idempotency = mock(IdempotencyService.class);
+        BusinessService business = mock(BusinessService.class);
+
+        RouterListener listener = new RouterListener(idempotency, business);
+
+        when(idempotency.isDuplicate("msg1")).thenReturn(false);
+
+        listener.listen("msg1");
+
+        verify(business).processMessage("msg1");
+        verify(idempotency).markProcessed("msg1");
+    }
+
+    @Test
+    void shouldSkipWhenDuplicate() {
+        IdempotencyService idempotency = mock(IdempotencyService.class);
+        BusinessService business = mock(BusinessService.class);
+
+        RouterListener listener = new RouterListener(idempotency, business);
+
+        when(idempotency.isDuplicate("msg1")).thenReturn(true);
+
+        listener.listen("msg1");
+
+        verifyNoInteractions(business);
+        verify(idempotency, never()).markProcessed("msg1");
+    }
+}
+📌 3. Integration Test (with LocalStack)
+package com.example.router;
+
+import org.junit.jupiter.api.Test;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.testcontainers.containers.localstack.LocalStackContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import com.amazonaws.services.sqs.AmazonSQS;
+import com.amazonaws.services.sqs.AmazonSQSClientBuilder;
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+
+@Testcontainers
+@SpringBootTest
+class SqsIntegrationTest {
+
+    @Container
+    static LocalStackContainer localstack = new LocalStackContainer("localstack/localstack:latest")
+            .withServices(LocalStackContainer.Service.SQS);
+
+    @DynamicPropertySource
+    static void configure(DynamicPropertyRegistry registry) {
+        registry.add("cloud.aws.region.static", localstack::getRegion);
+        registry.add("cloud.aws.credentials.access-key", localstack::getAccessKey);
+        registry.add("cloud.aws.credentials.secret-key", localstack::getSecretKey);
+        registry.add("cloud.aws.sqs.endpoint", 
+            () -> localstack.getEndpointOverride(LocalStackContainer.Service.SQS).toString());
+        registry.add("app.sqs.queue-name", () -> "router-queue");
+    }
+
+    @Autowired
+    private BusinessService businessService;
+
+    @Test
+    void shouldSendAndConsumeMessage() {
+        AmazonSQS sqs = AmazonSQSClientBuilder.standard()
+                .withEndpointConfiguration(localstack.getEndpointConfiguration(LocalStackContainer.Service.SQS))
+                .withCredentials(localstack.getDefaultCredentialsProvider())
+                .build();
+
+        String queueUrl = sqs.createQueue("router-queue").getQueueUrl();
+        sqs.sendMessage(queueUrl, "integration-test-msg");
+
+        // ⚠️ In real test, you’d wait or poll until RouterListener processes message
+        // Here we just assert service is wired
+        assertThat(businessService).isNotNull();
+    }
+}
+✅ With this setup:
+
+Unit tests → fast, test logic with mocks.
+
+Integration tests → use LocalStack (Docker) to simulate real SQS.
+
+Mongo → can be real (test DB) or use Flapdoodle Embedded Mongo for integration.
+
+Would you like me to also add embedded MongoDB (Flapdoodle) to the integration test so your team can run the full pipeline (SQS → RouterListener → Mongo) without needing real AWS/Mongo?
+
+You said:
+yes
+ChatGPT said:
+
+Thought for 6s
+Nice — below is a complete, ready-to-run example that ties everything together:
+
+Spring Boot app with @SqsListener
+
+Mongo-backed idempotency (Flapdoodle embedded Mongo for tests)
+
+Unit tests (JUnit + Mockito)
+
+Integration test using Testcontainers LocalStack (SQS) + embedded Mongo (Flapdoodle) and Awaitility to wait for processing
+
+You can copy/paste the snippets into your project. I keep the business logic intentionally simple so the tests are easy to follow.
+
+1) pom.xml (relevant dependencies)
+<dependencies>
+    <!-- Spring Boot -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter</artifactId>
+    </dependency>
+
+    <!-- Spring Data MongoDB -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-data-mongodb</artifactId>
+    </dependency>
+
+    <!-- Spring Cloud AWS SQS (awspring) -->
+    <dependency>
+        <groupId>io.awspring.cloud</groupId>
+        <artifactId>spring-cloud-aws-starter-sqs</artifactId>
+        <version>3.0.2</version>
+    </dependency>
+
+    <!-- AWS SDK v1 for tests (AmazonSQS client) -->
+    <dependency>
+        <groupId>com.amazonaws</groupId>
+        <artifactId>aws-java-sdk-sqs</artifactId>
+        <version>1.12.598</version>
+    </dependency>
+
+    <!-- Embedded Mongo for tests (Flapdoodle) -->
+    <dependency>
+        <groupId>de.flapdoodle.embed</groupId>
+        <artifactId>de.flapdoodle.embed.mongo</artifactId>
+        <version>4.7.2</version>
+        <scope>test</scope>
+    </dependency>
+
+    <!-- Testcontainers LocalStack -->
+    <dependency>
+        <groupId>org.testcontainers</groupId>
+        <artifactId>localstack</artifactId>
+        <version>1.19.0</version>
+        <scope>test</scope>
+    </dependency>
+
+    <!-- JUnit + Mockito -->
+    <dependency>
+        <groupId>org.junit.jupiter</groupId>
+        <artifactId>junit-jupiter</artifactId>
+        <version>5.10.0</version>
+        <scope>test</scope>
+    </dependency>
+    <dependency>
+        <groupId>org.mockito</groupId>
+        <artifactId>mockito-junit-jupiter</artifactId>
+        <version>5.3.1</version>
+        <scope>test</scope>
+    </dependency>
+
+    <!-- Awaitility for waiting in integration tests -->
+    <dependency>
+        <groupId>org.awaitility</groupId>
+        <artifactId>awaitility</artifactId>
+        <version>4.2.0</version>
+        <scope>test</scope>
+    </dependency>
+
+    <!-- Logging -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-logging</artifactId>
+    </dependency>
+</dependencies>
+2) App code
+RouterListener.java
+package com.example.router;
+
+import io.awspring.cloud.sqs.annotation.SqsListener;
+import org.springframework.stereotype.Service;
+
+/**
+ * Thin listener: delegates to RouterService
+ */
+@Service
+public class RouterListener {
+
+    private final RouterService routerService;
+
+    public RouterListener(RouterService routerService) {
+        this.routerService = routerService;
+    }
+
+    // We bind to body String for simplicity. Body contains a unique id for idempotency in this example.
+    @SqsListener("${app.sqs.queue-name}")
+    public void listen(String body) {
+        routerService.processMessage(body);
+    }
+}
+RouterService.java
+package com.example.router;
+
+import org.springframework.stereotype.Service;
+
+@Service
+public class RouterService {
+
+    private final IdempotencyService idempotencyService;
+    private final BusinessService businessService;
+
+    public RouterService(IdempotencyService idempotencyService, BusinessService businessService) {
+        this.idempotencyService = idempotencyService;
+        this.businessService = businessService;
+    }
+
+    /**
+     * Process message body. We assume message body itself is a unique messageId for demo.
+     */
+    public void processMessage(String messageBody) {
+        // messageBody is used as messageId for idempotency in this sample.
+        String messageId = messageBody;
+
+        // Check idempotency across instances (Mongo-backed)
+        if (!idempotencyService.isFirstProcess(messageId)) {
+            // duplicate: skip
+            return;
+        }
+
+        // Business logic
+        businessService.processMessage(messageBody);
+
+        // mark processed (idempotency entry already created by isFirstProcess in this implementation,
+        // but if your pattern differs you can ensure it's marked here).
+        // (In our implementation isFirstProcess inserts and returns true on first insert.)
+    }
+}
+BusinessService.java
+package com.example.router;
+
+import org.springframework.stereotype.Service;
+
+@Service
+public class BusinessService {
+
+    public void processMessage(String message) {
+        // put real business logic here. kept trivial for testability.
+        System.out.println("BusinessService processing: " + message);
+    }
+}
+IdempotencyService.java (Mongo-backed)
+package com.example.router;
+
+import com.mongodb.MongoWriteException;
+import org.bson.Document;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.stereotype.Service;
+
+import java.time.Instant;
+import java.util.Date;
+
+/**
+ * Uses collection "processedMessages". Unique key is _id = messageId.
+ * We insert a doc with _id = messageId using mongo's uniqueness guarantee.
+ * TTL index on "expireAt" should be created beforehand (see below).
+ */
+@Service
+public class IdempotencyService {
+
+    private final MongoTemplate mongoTemplate;
+
+    public IdempotencyService(MongoTemplate mongoTemplate) {
+        this.mongoTemplate = mongoTemplate;
+    }
+
+    /**
+     * Try to insert a doc with _id = messageId.
+     * Returns true if insert succeeded (first processor), false if duplicate.
+     */
+    public boolean isFirstProcess(String messageId) {
+        Document doc = new Document("_id", messageId)
+                .append("processedAt", new Date())
+                .append("expireAt", Date.from(Instant.now().plusSeconds(86400))); // expire after 1 day
+
+        try {
+            mongoTemplate.getCollection("processedMessages").insertOne(doc);
+            return true;
+        } catch (MongoWriteException e) {
+            // duplicate key -> already processed
+            if (e.getError().getCategory().equals(com.mongodb.ErrorCategory.DUPLICATE_KEY)) {
+                return false;
+            }
+            throw e;
+        }
+    }
+}
+Mongo indices — run once (shell / startup script)
+use routerdb;
+
+db.processedMessages.createIndex({ "_id": 1 }, { unique: true });
+
+db.processedMessages.createIndex({ "expireAt": 1 }, { expireAfterSeconds: 0 });
+(Embedded Flapdoodle will honor these indexes created by the test setup or you can create them programmatically in an @PostConstruct initializer.)
+
+application.yml (default)
+spring:
+  data:
+    mongodb:
+      uri: mongodb://localhost:27017/routerdb
+
+app:
+  sqs:
+    queue-name: router-queue
+For tests we’ll override AWS endpoint/credentials to point to LocalStack using DynamicPropertySource.
+
+3) Unit tests (fast, no docker)
+RouterServiceTest.java
+package com.example.router;
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.*;
+
+import static org.mockito.Mockito.*;
+
+class RouterServiceTest {
+
+    @Mock
+    private IdempotencyService idempotencyService;
+
+    @Mock
+    private BusinessService businessService;
+
+    private RouterService routerService;
+
+    @BeforeEach
+    void setUp() {
+        MockitoAnnotations.openMocks(this);
+        routerService = new RouterService(idempotencyService, businessService);
+    }
+
+    @Test
+    void shouldProcess_when_first_time() {
+        String msg = "msg-1";
+        when(idempotencyService.isFirstProcess(msg)).thenReturn(true);
+
+        routerService.processMessage(msg);
+
+        verify(businessService).processMessage(msg);
+    }
+
+    @Test
+    void shouldSkip_when_duplicate() {
+        String msg = "msg-1";
+        when(idempotencyService.isFirstProcess(msg)).thenReturn(false);
+
+        routerService.processMessage(msg);
+
+        verifyNoInteractions(businessService);
+    }
+
+    @Test
+    void shouldPropagateException_fromBusiness() {
+        String msg = "msg-1";
+        when(idempotencyService.isFirstProcess(msg)).thenReturn(true);
+        doThrow(new RuntimeException("boom")).when(businessService).processMessage(msg);
+
+        try {
+            routerService.processMessage(msg);
+        } catch (RuntimeException ignored) {}
+
+        verify(businessService).processMessage(msg);
+    }
+}
+4) Integration test (LocalStack + embedded Mongo)
+This test spins up LocalStack (SQS) and uses embedded Flapdoodle Mongo automatically (because we included the dependency). It creates an SQS queue, sends a message whose body equals the desired messageId, and waits until the idempotency record appears in Mongo.
+
+RouterIntegrationTest.java
+package com.example.router;
+
+import com.amazonaws.auth.AWSStaticCredentialsProvider;
+import com.amazonaws.auth.BasicAWSCredentials;
+import com.amazonaws.client.builder.AwsClientBuilder;
+import com.amazonaws.services.sqs.AmazonSQS;
+import com.amazonaws.services.sqs.AmazonSQSClientBuilder;
+import org.awaitility.Awaitility;
+import org.bson.Document;
+import org.junit.jupiter.api.*;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import org.testcontainers.containers.localstack.LocalStackContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+
+import java.time.Duration;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+@Testcontainers
+@SpringBootTest
+class RouterIntegrationTest {
+
+    @Container
+    static LocalStackContainer localstack = new LocalStackContainer("localstack/localstack:latest")
+            .withServices(LocalStackContainer.Service.SQS);
+
+    private static AmazonSQS sqsClient;
+    private static String queueUrl;
+
+    @Autowired
+    private MongoTemplate mongoTemplate;
+
+    @DynamicPropertySource
+    static void registerProperties(DynamicPropertyRegistry reg) {
+        // point awspring-cloud (spring-cloud-aws) at LocalStack
+        String endpoint = localstack.getEndpointOverride(LocalStackContainer.Service.SQS).toString();
+        reg.add("cloud.aws.sqs.endpoint", () -> endpoint);
+        reg.add("cloud.aws.region.static", localstack::getRegion);
+        reg.add("cloud.aws.credentials.access-key", localstack::getAccessKey);
+        reg.add("cloud.aws.credentials.secret-key", localstack::getSecretKey);
+
+        // queue name used by listener
+        reg.add("app.sqs.queue-name", () -> "router-queue");
+    }
+
+    @BeforeAll
+    static void beforeAll() {
+        AwsClientBuilder.EndpointConfiguration endpointConf =
+                new AwsClientBuilder.EndpointConfiguration(
+                        localstack.getEndpointOverride(LocalStackContainer.Service.SQS).toString(),
+                        localstack.getRegion());
+
+        sqsClient = AmazonSQSClientBuilder.standard()
+                .withEndpointConfiguration(endpointConf)
+                .withCredentials(new AWSStaticCredentialsProvider(
+                        new BasicAWSCredentials(localstack.getAccessKey(), localstack.getSecretKey())))
+                .build();
+    }
+
+    @BeforeEach
+    void setupQueue() {
+        queueUrl = sqsClient.createQueue("router-queue").getQueueUrl();
+
+        // ensure indexes exist in embedded mongo for processedMessages
+        mongoTemplate.getCollection("processedMessages")
+                .createIndex(new Document("expireAt", 1), new com.mongodb.client.model.IndexOptions().expireAfter(0L, TimeUnit.SECONDS));
+    }
+
+    @Test
+    void endToEnd_messageConsumed_and_persistedInMongo() {
+        String messageId = "intg-msg-1";
+
+        // send message (we use the message body as the messageId in this sample)
+        sqsClient.sendMessage(queueUrl, messageId);
+
+        // wait until an entry with _id=messageId appears in processedMessages collection
+        Awaitility.await()
+                .atMost(Duration.ofSeconds(30))
+                .pollInterval(Duration.ofSeconds(1))
+                .untilAsserted(() -> {
+                    Document doc = mongoTemplate.getCollection("processedMessages").find(new Document("_id", messageId)).first();
+                    assertThat(doc).isNotNull();
+                });
+    }
+}
+Notes:
+
+The test uses LocalStack to simulate SQS and sends a message directly using AWS SDK v1 AmazonSQS.
+
+The application’s @SqsListener (running in the same Spring context) should pick up the message and call RouterService → IdempotencyService, which inserts the document into Mongo.
+
+Awaitility polls the Mongo collection until the processed document appears (or times out).
+
+5) Test / Run tips
+Run tests with Docker available (LocalStack needs Docker). The unit tests run without Docker; the integration test requires Docker.
+
+If you want the integration test to run only locally, mark it with a JUnit tag and exclude it in CI if Docker is not available.
+
+Ensure Flapdoodle embedded Mongo is on the test classpath (we added it in pom.xml scope test). Spring Boot auto-configures embedded Mongo if no external Mongo is configured for the test profile.
+
+If indexes are not present automatically, create them programmatically as shown in @BeforeEach of the integration test.
+
+If you want I can:
+
+Convert IdempotencyService to use a Spring Data repository (instead of MongoTemplate) so you can use a repository in tests easily.
+
+Add a @Configuration that creates the TTL and unique index automatically at app startup.
+
+Provide a complete GitHub-style project tree with files ready to drop into your repo.
+
+Which of those would you like next?
+
+You said:
+i dont have docker locally remove and show final pom
+ChatGPT said:
+Got it 👍 — since you don’t have Docker locally, we’ll skip LocalStack / Testcontainers and keep things purely unit-testable.
+That means:
+
+For unit tests → we’ll mock SQS (AmazonSQSAsync) and Mongo.
+
+No Docker, no external dependencies.
+
+You’ll still be able to test the business logic + idempotency flow.
+
+Here’s the final setup:
+
+✅ pom.xml
+Add Spring Boot, Spring Cloud AWS SQS, MongoDB, JUnit 5, and Mockito.
+
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.example</groupId>
+    <artifactId>router-service</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.2.5</version>
+    </parent>
+
+    <properties>
+        <java.version>17</java.version>
+        <spring-cloud.version>2023.0.1</spring-cloud.version>
+    </properties>
+
+    <dependencies>
+        <!-- Spring Boot -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter</artifactId>
+        </dependency>
+
+        <!-- MongoDB -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-mongodb</artifactId>
+        </dependency>
+
+        <!-- Spring Cloud AWS SQS -->
+        <dependency>
+            <groupId>io.awspring.cloud</groupId>
+            <artifactId>spring-cloud-aws-starter-sqs</artifactId>
+        </dependency>
+
+        <!-- Lombok (optional for less boilerplate) -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- Testing -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-core</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.springframework.cloud</groupId>
+                <artifactId>spring-cloud-dependencies</artifactId>
+                <version>${spring-cloud.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+</project>
+✅ Business Code
+ProcessedMessage.java
+import org.springframework.data.annotation.Id;
+import org.springframework.data.mongodb.core.mapping.Document;
+
+@Document(collection = "processed_messages")
+public class ProcessedMessage {
+    @Id
+    private String messageId;
+
+    public ProcessedMessage(String messageId) {
+        this.messageId = messageId;
+    }
+
+    public String getMessageId() {
+        return messageId;
+    }
+}
+ProcessedMessageRepository.java
+import org.springframework.data.mongodb.repository.MongoRepository;
+
+public interface ProcessedMessageRepository extends MongoRepository<ProcessedMessage, String> {
+}
+IdempotencyService.java
+import org.springframework.stereotype.Service;
+
+@Service
+public class IdempotencyService {
+
+    private final ProcessedMessageRepository repository;
+
+    public IdempotencyService(ProcessedMessageRepository repository) {
+        this.repository = repository;
+    }
+
+    public boolean isDuplicate(String messageId) {
+        return repository.existsById(messageId);
+    }
+
+    public void markProcessed(String messageId) {
+        repository.save(new ProcessedMessage(messageId));
+    }
+}
+RouterListener.java
+import io.awspring.cloud.sqs.annotation.SqsListener;
+import org.springframework.stereotype.Service;
+
+@Service
+public class RouterListener {
+
+    private final IdempotencyService idempotencyService;
+
+    public RouterListener(IdempotencyService idempotencyService) {
+        this.idempotencyService = idempotencyService;
+    }
+
+    @SqsListener("${app.sqs.queue-name}")
+    public void listen(String message) {
+        String messageId = extractMessageId(message);
+
+        if (idempotencyService.isDuplicate(messageId)) {
+            System.out.println("Skipping duplicate message: " + messageId);
+            return;
+        }
+
+        try {
+            // ✅ Business logic
+            System.out.println("Processing message: " + message);
+
+            // Mark as processed
+            idempotencyService.markProcessed(messageId);
+
+        } catch (Exception ex) {
+            throw ex; // let Spring handle retry/DLQ
+        }
+    }
+
+    private String extractMessageId(String message) {
+        // Simplified: in real case extract from payload
+        return message.hashCode() + "";
+    }
+}
+✅ Unit Test
+RouterListenerTest.java
+import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
+
+import static org.mockito.Mockito.*;
+
+class RouterListenerTest {
+
+    @Test
+    void shouldProcessMessageIfNotDuplicate() {
+        IdempotencyService idempotencyService = Mockito.mock(IdempotencyService.class);
+        RouterListener listener = new RouterListener(idempotencyService);
+
+        String message = "hello-123";
+        String messageId = String.valueOf(message.hashCode());
+
+        when(idempotencyService.isDuplicate(messageId)).thenReturn(false);
+
+        listener.listen(message);
+
+        verify(idempotencyService).markProcessed(messageId);
+    }
+
+    @Test
+    void shouldSkipDuplicateMessage() {
+        IdempotencyService idempotencyService = Mockito.mock(IdempotencyService.class);
+        RouterListener listener = new RouterListener(idempotencyService);
+
+        String message = "hello-123";
+        String messageId = String.valueOf(message.hashCode());
+
+        when(idempotencyService.isDuplicate(messageId)).thenReturn(true);
+
+        listener.listen(message);
+
+        verify(idempotencyService, never()).markProcessed(messageId);
+    }
+}
+👉 This gives you:
+
+Spring Boot + SQS listener + Mongo idempotency
+
+Unit tests without Docker
+
+Mocks for Mongo (so no real DB needed)
+
+Purely in-memory testing setup
+
+Do you also want me to show you a lightweight integration test that runs with embedded MongoDB (Flapdoodle) so you can validate idempotency without needing a real Mongo?
+
+You said:
+yes
+ChatGPT said:
+Perfect 👍 since you don’t have Docker, the next best thing is to use Embedded Mongo (Flapdoodle) for integration testing.
+That way you can spin up a real MongoDB instance in memory during tests and verify idempotency behavior.
+
+Here’s how we set it up 👇
+
+✅ Update pom.xml
+Add embedded MongoDB only for tests:
+
+<dependency>
+    <groupId>de.flapdoodle.embed</groupId>
+    <artifactId>de.flapdoodle.embed.mongo</artifactId>
+    <scope>test</scope>
+</dependency>
+✅ Integration Test with Embedded Mongo
+IdempotencyServiceIT.java
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.data.mongo.DataMongoTest;
+import org.springframework.test.context.ActiveProfiles;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+@DataMongoTest
+@ActiveProfiles("test")
+class IdempotencyServiceIT {
+
+    @Autowired
+    private ProcessedMessageRepository repository;
+
+    @Test
+    void testIdempotencyFlow() {
+        IdempotencyService service = new IdempotencyService(repository);
+
+        String messageId = "msg-123";
+
+        // Initially, not duplicate
+        assertThat(service.isDuplicate(messageId)).isFalse();
+
+        // Mark processed
+        service.markProcessed(messageId);
+
+        // Now, duplicate
+        assertThat(service.isDuplicate(messageId)).isTrue();
+    }
+}
+RouterListenerIT.java
+This one wires up the listener + Mongo (embedded) but still doesn’t need real SQS (we directly call the listener method).
+
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.test.context.ActiveProfiles;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+@SpringBootTest
+@ActiveProfiles("test")
+class RouterListenerIT {
+
+    @Autowired
+    private RouterListener listener;
+
+    @Autowired
+    private ProcessedMessageRepository repository;
+
+    @Test
+    void shouldProcessMessageAndStoreIdempotency() {
+        String message = "integration-test-message";
+        String messageId = String.valueOf(message.hashCode());
+
+        listener.listen(message);
+
+        assertThat(repository.existsById(messageId)).isTrue();
+    }
+
+    @Test
+    void shouldSkipDuplicateMessage() {
+        String message = "integration-test-message-dup";
+        String messageId = String.valueOf(message.hashCode());
+
+        // Insert once
+        repository.save(new ProcessedMessage(messageId));
+
+        // Call again
+        listener.listen(message);
+
+        // Still only one record
+        assertThat(repository.count()).isEqualTo(1);
+    }
+}
+✅ Profiles Setup (optional but clean)
+Add an application-test.yml under src/test/resources:
+
+spring:
+  data:
+    mongodb:
+      database: test-db
+This way tests always use in-memory Mongo, and your dev/prod configs remain untouched.
+
+✅ Now you have:
+
+Unit tests (pure mocks)
+
+Integration tests (embedded Mongo, no Docker)
+
+Idempotency flow verified against real Mongo operations
+
+Do you want me to also show how to simulate SQS messages in integration tests (using just direct calls, no AWS infra) so you can test the whole flow as if a message was consumed?
+
+You said:
+show final application.yml
+ChatGPT said:
+Got it 👍 — here’s a clean application.yml setup for your Router Service in Spring Boot with SQS + MongoDB.
+We’ll keep it environment-friendly (dev/prod/test separation).
+
+✅ src/main/resources/application.yml
+spring:
+  application:
+    name: router-service
+
+  data:
+    mongodb:
+      uri: mongodb://localhost:27017/routerdb
+      database: routerdb
+
+cloud:
+  aws:
+    region:
+      static: ap-south-1   # change to your AWS region
+    stack:
+      auto: false
+    credentials:
+      access-key: ${AWS_ACCESS_KEY_ID}
+      secret-key: ${AWS_SECRET_ACCESS_KEY}
+
+sqs:
+  queue:
+    name: router-queue   # your SQS queue name
+✅ src/test/resources/application-test.yml
+Uses embedded MongoDB and disables AWS (so tests don’t touch cloud).
+
+spring:
+  application:
+    name: router-service-test
+
+  data:
+    mongodb:
+      database: test-routerdb
+
+cloud:
+  aws:
+    region:
+      static: us-east-1
+    stack:
+      auto: false
+    credentials:
+      access-key: fake
+      secret-key: fake
+
+sqs:
+  queue:
+    name: test-router-queue
+🔑 Notes:
+In main config:
+
+Replace mongodb://localhost:27017/routerdb with your real MongoDB connection string (for ECS, likely mongodb://mongo:27017/routerdb or Atlas URI).
+
+AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are injected from environment variables (ECS task role is better — then you don’t need to set creds explicitly).
+
+In test config:
+
+No real AWS needed (SQS not polled in tests — you call listener directly).
+
+Embedded Mongo auto-starts with Flapdoodle.
+
+👉 Do you want me to also add SQS listener concurrency & visibility timeout configs inside application.yml so you can tune how multiple ECS instances consume messages?
+
+You said:
+we are using iam role
+ChatGPT said:
+Perfect 🙌 — if you’re using IAM Role for ECS tasks, then you don’t need to put AWS access keys in application.yml at all.
+The AWS SDK for Java (and Spring Cloud AWS) will automatically pick up credentials from the ECS Task Role metadata service.
+
+Here’s the clean final application.yml tailored for ECS + MongoDB + SQS:
+
+✅ src/main/resources/application.yml
+spring:
+  application:
+    name: router-service
+
+  data:
+    mongodb:
+      uri: mongodb://mongo:27017/routerdb  # update if using Mongo Atlas
+      database: routerdb
+
+cloud:
+  aws:
+    region:
+      static: ap-south-1   # set your AWS region
+    stack:
+      auto: false   # prevents CloudFormation lookup
+
+sqs:
+  queue:
+    name: router-queue   # your SQS queue name
+✅ src/test/resources/application-test.yml
+This one is for local + CI tests, using embedded MongoDB and fake AWS credentials (no cloud calls).
+
+spring:
+  application:
+    name: router-service-test
+
+  data:
+    mongodb:
+      database: test-routerdb
+
+cloud:
+  aws:
+    region:
+      static: us-east-1
+    stack:
+      auto: false
+    credentials:
+      access-key: fake
+      secret-key: fake
+
+sqs:
+  queue:
+    name: test-router-queue
+🔑 Key Points for ECS Deployment
+IAM Role → Attach an IAM role with SQS + CloudWatch + (if needed) DynamoDB/Mongo access to your ECS Task Definition.
+
+No credentials in code or configs → AWS SDK will resolve from ECS task metadata service automatically.
+
+MongoDB → If you’re on ECS with a managed DB:
+
+Use Mongo Atlas connection string like
+mongodb+srv://<user>:<pass>@cluster0.mongodb.net/routerdb
+
+Or internal VPC endpoint if running Mongo in AWS.
+
+👉 Do you also want me to show how to configure SQS listener concurrency & visibility timeout in application.yml, so multiple ECS task instances don’t step on each other?
+
+You said:
+yes
+ChatGPT said:
+Great 👍 let’s tune SQS listener concurrency + visibility timeout so your Router Service ECS tasks work well together.
+
+In Spring Cloud AWS (using @SqsListener), you can configure these in application.yml.
+
+✅ Updated application.yml
+spring:
+  application:
+    name: router-service
+
+  data:
+    mongodb:
+      uri: mongodb://mongo:27017/routerdb
+      database: routerdb
+
+cloud:
+  aws:
+    region:
+      static: ap-south-1
+    stack:
+      auto: false
+
+sqs:
+  queue:
+    name: router-queue
+
+  listener:
+    # max number of concurrent threads per application instance
+    max-concurrent-messages: 10  
+
+    # number of messages fetched in one poll (batch)
+    max-messages: 5
+
+    # wait time for long polling (reduce empty responses)
+    wait-time: 20s  
+
+    # visibility timeout (how long the message is hidden while being processed)
+    visibility-timeout: 60s
+🔑 Explanation:
+max-concurrent-messages: 10 → each ECS task can process up to 10 messages in parallel.
+
+max-messages: 5 → poll up to 5 at once from SQS.
+
+wait-time: 20s → long polling improves efficiency, fewer empty polls.
+
+visibility-timeout: 60s → once a message is received, it won’t reappear in the queue for 60s (must finish or extend before then).
+
+If processing can take longer than 60s, either:
+
+Increase visibility-timeout, or
+
+Use ChangeMessageVisibility API inside your listener to extend dynamically.
+
+✅ Scaling with Multiple ECS Tasks
+SQS guarantees at-least-once delivery.
+
+Multiple ECS tasks compete for messages → AWS ensures a message goes to only one consumer at a time (until visibility timeout expires).
+
+Your MongoDB idempotency check prevents double-processing if the message reappears due to timeout/retry.
+
+👉 Do you want me to also show you how to dynamically extend visibility timeout from code (e.g., when processing might exceed 1 min)?
+
+You said:
+ok
+ChatGPT said:
+Perfect 👍 let’s add dynamic visibility timeout extension.
+
+This is useful if your Router Service might take longer than the default visibility-timeout (e.g., large batch notification routing).
+
+✅ Example: Extending Visibility Timeout Dynamically
+import io.awspring.cloud.sqs.annotation.SqsListener;
+import io.awspring.cloud.sqs.operations.SqsTemplate;
+import org.springframework.stereotype.Service;
+
+import software.amazon.awssdk.services.sqs.SqsClient;
+import software.amazon.awssdk.services.sqs.model.ChangeMessageVisibilityRequest;
+import software.amazon.awssdk.services.sqs.model.Message;
+
+@Service
+public class RouterService {
+
+    private final SqsClient sqsClient;
+    private final String queueUrl;
+
+    public RouterService(SqsClient sqsClient) {
+        this.sqsClient = sqsClient;
+        // resolve once at startup
+        this.queueUrl = sqsClient.getQueueUrl(r -> r.queueName("router-queue")).queueUrl();
+    }
+
+    @SqsListener("router-queue")
+    public void handleMessage(Message message) {
+        String messageId = message.messageId();
+
+        try {
+            System.out.println("Processing message: " + messageId);
+
+            // Example: if processing might take long, extend visibility
+            extendVisibilityTimeout(message, 120); // extend to 120s
+
+            // process business logic
+            doBusinessLogic(message.body());
+
+            // ack happens automatically if no exception
+        } catch (Exception e) {
+            System.err.println("Error processing " + messageId + ": " + e.getMessage());
+            throw e; // ensures redelivery / DLQ
+        }
+    }
+
+    private void doBusinessLogic(String body) throws InterruptedException {
+        // simulate long processing
+        Thread.sleep(90_000); // 90 seconds
+        System.out.println("Business logic done for: " + body);
+    }
+
+    private void extendVisibilityTimeout(Message message, int timeoutSeconds) {
+        sqsClient.changeMessageVisibility(
+                ChangeMessageVisibilityRequest.builder()
+                        .queueUrl(queueUrl)
+                        .receiptHandle(message.receiptHandle())
+                        .visibilityTimeout(timeoutSeconds)
+                        .build()
+        );
+        System.out.println("Extended visibility timeout for " + message.messageId() + " to " + timeoutSeconds + "s");
+    }
+}
+🔑 How This Works:
+Default timeout is set in application.yml (e.g., 60s).
+
+If your processing might exceed that:
+
+Call changeMessageVisibility before timeout expires.
+
+Example above extends to 120s.
+
+Repeat extension if needed (for very long jobs).
+
+✅ Best Practices
+Don’t set visibility timeout too high in config — short + extend dynamically is safer.
+
+Use idempotency in MongoDB to prevent duplicate side effects.
+
+Monitor CloudWatch metric ApproximateNumberOfMessagesNotVisible → high values = stuck or long-running consumers.
+
+👉 Do you want me to also show you how to test visibility timeout extension with a JUnit test using a mock SqsClient?
+
+You said:
+show final pom
+ChatGPT said:
+Got it 👍 Since you said you don’t have Docker locally, we’ll avoid LocalStack/Docker-based SQS in tests.
+Instead, we’ll rely on Spring Boot + Spring Cloud AWS SQS and mock SqsClient for unit/integration tests.
+
+Here’s the final pom.xml for your Router Service:
+
+✅ Final pom.xml
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 
+                             http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.example</groupId>
+    <artifactId>router-service</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <name>Router Service</name>
+    <description>Router Service consuming SQS messages in ECS</description>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.3.3</version>
+        <relativePath/>
+    </parent>
+
+    <properties>
+        <java.version>17</java.version>
+        <spring-cloud-aws.version>3.1.1</spring-cloud-aws.version>
+    </properties>
+
+    <dependencies>
+        <!-- Spring Boot starters -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <!-- MongoDB -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-mongodb</artifactId>
+        </dependency>
+
+        <!-- AWS SQS support -->
+        <dependency>
+            <groupId>io.awspring.cloud</groupId>
+            <artifactId>spring-cloud-aws-starter-sqs</artifactId>
+            <version>${spring-cloud-aws.version}</version>
+        </dependency>
+
+        <!-- AWS SDK v2 for advanced SQS control (visibility timeout extension etc.) -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>sqs</artifactId>
+        </dependency>
+
+        <!-- Testing -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Mockito for mocking AWS SDK clients -->
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-core</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Embedded MongoDB for integration tests -->
+        <dependency>
+            <groupId>de.flapdoodle.embed</groupId>
+            <artifactId>de.flapdoodle.embed.mongo</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- Spring Boot plugin -->
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+🔑 Key Notes:
+✅ spring-cloud-aws-starter-sqs → provides @SqsListener.
+
+✅ software.amazon.awssdk:sqs → lets you extend visibility dynamically.
+
+✅ No Docker dependency → tests can run with Mockito and embedded MongoDB.
+
+✅ Compatible with ECS + IAM Role for Service Accounts (no hardcoded creds).
+
+👉 Do you also want me to show you a unit test class for RouterService that mocks SqsClient and verifies changeMessageVisibility is called?
+
+
+
+
+No file chosenNo file chosen
+ChatGPT can make mistakes. Check important info. See Cookie Preferences.
