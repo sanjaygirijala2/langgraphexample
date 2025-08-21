@@ -1,0 +1,1335 @@
+// Enhanced Routing Service with Full Rule Engine Integration
+package com.notification.platform.routing.service;
+
+import com.notification.platform.routing.domain.*;
+import com.notification.platform.routing.rules.engine.*;
+import com.notification.platform.routing.rules.core.*;
+import com.notification.platform.routing.external.*;
+import com.notification.platform.routing.queue.*;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
+import java.time.Instant;
+import java.time.ZonedDateTime;
+import java.util.*;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class RoutingService {
+    
+    private final RuleEngine ruleEngine;
+    private final CapabilityRouteMappingService capabilityService;
+    private final UserPreferenceService preferenceService;
+    private final UserPresenceService presenceService;
+    private final EmployeeDataService employeeDataService;
+    private final BFFService bffService;
+    private final TemplateService templateService;
+    private final EventBridgePublisher eventBridgePublisher;
+    private final NotificationScheduler notificationScheduler;
+    private final MeterRegistry meterRegistry;
+    
+    /**
+     * Main entry point for routing notifications
+     */
+    public RoutingDecision routeNotification(RoutingContext context) {
+        Timer.Sample sample = Timer.start(meterRegistry);
+        
+        try {
+            log.info("Starting routing for notification: {}, capability: {}", 
+                context.getNotificationId(), context.getCapability());
+            
+            // Step 1: Get initial routes for capability
+            Set<Route> capabilityRoutes = capabilityService.getRoutesForCapability(
+                context.getCapability()
+            );
+            
+            if (capabilityRoutes.isEmpty()) {
+                log.warn("No routes configured for capability: {}", context.getCapability());
+                return buildEmptyDecision(context, "No routes configured");
+            }
+            
+            // Step 2: Gather all required data for rules
+            RuleInputData inputData = gatherRuleInputData(context);
+            
+            // Step 3: Execute rules through the engine
+            RuleEngineResult ruleResult = ruleEngine.executeRules(
+                context,
+                capabilityRoutes,
+                inputData.getUserPreferences(),
+                inputData.getUserPresence(),
+                inputData.getEmployeeData()
+            );
+            
+            // Step 4: Handle rule execution results
+            if (!ruleResult.isSuccess()) {
+                log.warn("Rule execution failed for notification: {}", 
+                    context.getNotificationId());
+                return buildFailedDecision(context, ruleResult);
+            }
+            
+            // Step 5: Check if we have any routes left after filtering
+            if (ruleResult.getFilteredRoutes().isEmpty()) {
+                log.info("All routes filtered out for notification: {}", 
+                    context.getNotificationId());
+                return handleNoRoutesAvailable(context, ruleResult);
+            }
+            
+            // Step 6: Build enriched channel messages
+            List<ChannelMessage> channelMessages = buildEnrichedChannelMessages(
+                ruleResult.getFilteredRoutes(),
+                context,
+                inputData.getEmployeeData(),
+                ruleResult.getMetadata()
+            );
+            
+            // Step 7: Handle scheduling if needed
+            if (ruleResult.getSuggestedDeliveryTime() != null && 
+                ruleResult.getSuggestedDeliveryTime().isAfter(ZonedDateTime.now())) {
+                
+                return handleScheduledDelivery(
+                    context, 
+                    channelMessages, 
+                    ruleResult.getSuggestedDeliveryTime()
+                );
+            }
+            
+            // Step 8: Publish messages for immediate delivery
+            publishMessages(channelMessages);
+            
+            // Step 9: Build and return routing decision
+            return buildSuccessDecision(context, channelMessages, ruleResult);
+            
+        } catch (Exception e) {
+            log.error("Error routing notification: {}", context.getNotificationId(), e);
+            return buildErrorDecision(context, e);
+            
+        } finally {
+            sample.stop(Timer.builder("routing.total.time")
+                .tag("capability", context.getCapability())
+                .tag("smart", String.valueOf(context.isSmartNotification()))
+                .register(meterRegistry));
+        }
+    }
+    
+    /**
+     * Gather all required data for rule execution
+     */
+    private RuleInputData gatherRuleInputData(RoutingContext context) {
+        // Fetch data in parallel for better performance
+        CompletableFuture<UserPreferences> preferencesFuture = 
+            CompletableFuture.supplyAsync(() -> 
+                preferenceService.getUserPreferences(context.getUserId())
+            );
+        
+        CompletableFuture<UserPresence> presenceFuture = 
+            CompletableFuture.supplyAsync(() -> 
+                presenceService.getUserPresence(context.getUserId())
+            );
+        
+        CompletableFuture<EmployeeData> employeeFuture = 
+            CompletableFuture.supplyAsync(() -> 
+                employeeDataService.getEmployeeData(context.getUserId())
+            );
+        
+        // Wait for all futures to complete
+        CompletableFuture.allOf(preferencesFuture, presenceFuture, employeeFuture).join();
+        
+        return RuleInputData.builder()
+            .userPreferences(preferencesFuture.join())
+            .userPresence(presenceFuture.join())
+            .employeeData(employeeFuture.join())
+            .build();
+    }
+    
+    /**
+     * Build enriched channel messages with personalization and deep links
+     */
+    private List<ChannelMessage> buildEnrichedChannelMessages(
+            List<Route> routes,
+            RoutingContext context,
+            EmployeeData employeeData,
+            Map<String, Object> ruleMetadata) {
+        
+        List<ChannelMessage> messages = new ArrayList<>();
+        
+        for (Route route : routes) {
+            try {
+                // Get template
+                Template template = templateService.getTemplate(route.getTemplateId());
+                
+                // Check if rule engine provided alternative template
+                if (ruleMetadata.containsKey("template_override_" + route.getRouteId())) {
+                    String overrideTemplateId = (String) ruleMetadata.get(
+                        "template_override_" + route.getRouteId()
+                    );
+                    template = templateService.getTemplate(overrideTemplateId);
+                }
+                
+                // Personalize content
+                Map<String, Object> personalizedContent = personalizeTemplate(
+                    template,
+                    context,
+                    employeeData,
+                    ruleMetadata
+                );
+                
+                // Generate deep links
+                List<DeepLink> deepLinks = generateDeepLinks(
+                    template,
+                    context,
+                    route.getChannel().getType()
+                );
+                
+                // Build message
+                ChannelMessage message = ChannelMessage.builder()
+                    .messageId(UUID.randomUUID().toString())
+                    .notificationId(context.getNotificationId())
+                    .channel(route.getChannel().getType())
+                    .templateId(template.getTemplateId())
+                    .personalizedContent(personalizedContent)
+                    .metadata(mergeMetadata(context.getMetadata(), ruleMetadata))
+                    .priority(context.getPriority())
+                    .targetQueue(getTargetQueue(route.getChannel().getType()))
+                    .deepLinks(deepLinks)
+                    .build();
+                
+                messages.add(message);
+                
+                log.debug("Built channel message for route: {}, channel: {}", 
+                    route.getRouteId(), route.getChannel().getType());
+                
+            } catch (Exception e) {
+                log.error("Failed to build message for route: {}", route.getRouteId(), e);
+                // Continue with other routes
+            }
+        }
+        
+        return messages;
+    }
+    
+    /**
+     * Personalize template with all available data
+     */
+    private Map<String, Object> personalizeTemplate(
+            Template template,
+            RoutingContext context,
+            EmployeeData employeeData,
+            Map<String, Object> ruleMetadata) {
+        
+        Map<String, Object> personalized = new HashMap<>();
+        
+        // Layer 1: Template defaults
+        if (template.getDefaultValues() != null) {
+            personalized.putAll(template.getDefaultValues());
+        }
+        
+        // Layer 2: Context payload
+        if (context.getPayload() != null) {
+            personalized.putAll(context.getPayload());
+        }
+        
+        // Layer 3: Employee data
+        if (employeeData != null) {
+            personalized.put("firstName", employeeData.getFirstName());
+            personalized.put("lastName", employeeData.getLastName());
+            personalized.put("fullName", 
+                employeeData.getFirstName() + " " + employeeData.getLastName());
+            personalized.put("email", employeeData.getEmail());
+            personalized.put("department", employeeData.getDepartment());
+            personalized.put("title", employeeData.getTitle());
+            
+            if (employeeData.getAdditionalAttributes() != null) {
+                personalized.putAll(employeeData.getAdditionalAttributes());
+            }
+        }
+        
+        // Layer 4: Rule metadata (highest priority)
+        if (ruleMetadata != null) {
+            // Add any personalization from rules (e.g., A/B test variants)
+            ruleMetadata.entrySet().stream()
+                .filter(e -> e.getKey().startsWith("personalization_"))
+                .forEach(e -> personalized.put(
+                    e.getKey().replace("personalization_", ""), 
+                    e.getValue()
+                ));
+        }
+        
+        // Process template content
+        if (template.getContent() != null) {
+            Map<String, String> processedContent = new HashMap<>();
+            for (Map.Entry<String, String> entry : template.getContent().entrySet()) {
+                processedContent.put(
+                    entry.getKey(),
+                    substituteVariables(entry.getValue(), personalized)
+                );
+            }
+            personalized.put("content", processedContent);
+        }
+        
+        return personalized;
+    }
+    
+    /**
+     * Generate deep links for the message
+     */
+    private List<DeepLink> generateDeepLinks(
+            Template template,
+            RoutingContext context,
+            ChannelType channelType) {
+        
+        if (template.getDeepLinkPlaceholders() == null || 
+            template.getDeepLinkPlaceholders().isEmpty()) {
+            return new ArrayList<>();
+        }
+        
+        return template.getDeepLinkPlaceholders().stream()
+            .map(placeholder -> {
+                try {
+                    return bffService.generateDeepLink(
+                        placeholder.getActionType(),
+                        placeholder.getParameters(),
+                        context.getUserId(),
+                        channelType
+                    );
+                } catch (Exception e) {
+                    log.error("Failed to generate deep link for action: {}", 
+                        placeholder.getActionType(), e);
+                    return null;
+                }
+            })
+            .filter(Objects::nonNull)
+            .collect(Collectors.toList());
+    }
+    
+    /**
+     * Handle scheduled delivery
+     */
+    private RoutingDecision handleScheduledDelivery(
+            RoutingContext context,
+            List<ChannelMessage> messages,
+            ZonedDateTime scheduledTime) {
+        
+        log.info("Scheduling notification {} for delivery at {}", 
+            context.getNotificationId(), scheduledTime);
+        
+        // Store messages for scheduled delivery
+        notificationScheduler.scheduleMessages(messages, scheduledTime);
+        
+        return RoutingDecision.builder()
+            .notificationId(context.getNotificationId())
+            .channelMessages(messages)
+            .timestamp(Instant.now())
+            .correlationId(context.getCorrelationId())
+            .scheduledDeliveryTime(scheduledTime)
+            .isSmartNotification(context.isSmartNotification())
+            .status(RoutingStatus.SCHEDULED)
+            .build();
+    }
+    
+    /**
+     * Handle case when no routes are available
+     */
+    private RoutingDecision handleNoRoutesAvailable(
+            RoutingContext context,
+            RuleEngineResult ruleResult) {
+        
+        // Check if scheduling was requested
+        if (ruleResult.getSuggestedDeliveryTime() != null) {
+            log.info("No routes currently available, will retry at: {}", 
+                ruleResult.getSuggestedDeliveryTime());
+            
+            // Schedule retry
+            notificationScheduler.scheduleRetry(context, ruleResult.getSuggestedDeliveryTime());
+            
+            return RoutingDecision.builder()
+                .notificationId(context.getNotificationId())
+                .timestamp(Instant.now())
+                .correlationId(context.getCorrelationId())
+                .scheduledDeliveryTime(ruleResult.getSuggestedDeliveryTime())
+                .status(RoutingStatus.RETRY_SCHEDULED)
+                .message("No routes available, scheduled for retry")
+                .build();
+        }
+        
+        return buildEmptyDecision(context, "All routes filtered by rules");
+    }
+    
+    /**
+     * Publish messages to EventBridge
+     */
+    private void publishMessages(List<ChannelMessage> messages) {
+        messages.forEach(message -> {
+            try {
+                eventBridgePublisher.publish(message);
+                log.info("Published message {} to channel {}", 
+                    message.getMessageId(), message.getChannel());
+            } catch (Exception e) {
+                log.error("Failed to publish message: {}", message.getMessageId(), e);
+                // Could implement retry logic here
+            }
+        });
+    }
+    
+    /**
+     * Utility methods for building routing decisions
+     */
+    private RoutingDecision buildSuccessDecision(
+            RoutingContext context,
+            List<ChannelMessage> messages,
+            RuleEngineResult ruleResult) {
+        
+        return RoutingDecision.builder()
+            .notificationId(context.getNotificationId())
+            .channelMessages(messages)
+            .timestamp(Instant.now())
+            .correlationId(context.getCorrelationId())
+            .scheduledDeliveryTime(ruleResult.getSuggestedDeliveryTime())
+            .isSmartNotification(context.isSmartNotification())
+            .status(RoutingStatus.SUCCESS)
+            .ruleExecutionSummary(buildRuleSummary(ruleResult))
+            .build();
+    }
+    
+    private RoutingDecision buildFailedDecision(
+            RoutingContext context,
+            RuleEngineResult ruleResult) {
+        
+        String failureReason = ruleResult.getExecutionResults().stream()
+            .filter(r -> r.getAction() == RuleAction.STOP_FAILURE)
+            .map(RuleExecutionResult::getReason)
+            .findFirst()
+            .orElse("Unknown failure");
+        
+        return RoutingDecision.builder()
+            .notificationId(context.getNotificationId())
+            .timestamp(Instant.now())
+            .correlationId(context.getCorrelationId())
+            .status(RoutingStatus.FAILED)
+            .message(failureReason)
+            .ruleExecutionSummary(buildRuleSummary(ruleResult))
+            .build();
+    }
+    
+    private RoutingDecision buildEmptyDecision(RoutingContext context, String reason) {
+        return RoutingDecision.builder()
+            .notificationId(context.getNotificationId())
+            .timestamp(Instant.now())
+            .correlationId(context.getCorrelationId())
+            .status(RoutingStatus.NO_ROUTES)
+            .message(reason)
+            .build();
+    }
+    
+    private RoutingDecision buildErrorDecision(RoutingContext context, Exception e) {
+        return RoutingDecision.builder()
+            .notificationId(context.getNotificationId())
+            .timestamp(Instant.now())
+            .correlationId(context.getCorrelationId())
+            .status(RoutingStatus.ERROR)
+            .message("Routing error: " + e.getMessage())
+            .build();
+    }
+    
+    private Map<String, String> buildRuleSummary(RuleEngineResult result) {
+        return result.getExecutionResults().stream()
+            .collect(Collectors.toMap(
+                RuleExecutionResult::getRuleName,
+                r -> r.getAction().toString(),
+                (v1, v2) -> v2
+            ));
+    }
+    
+    private Map<String, String> mergeMetadata(
+            Map<String, String> contextMetadata,
+            Map<String, Object> ruleMetadata) {
+        
+        Map<String, String> merged = new HashMap<>();
+        
+        if (contextMetadata != null) {
+            merged.putAll(contextMetadata);
+        }
+        
+        if (ruleMetadata != null) {
+            ruleMetadata.forEach((k, v) -> {
+                if (v != null) {
+                    merged.put(k, v.toString());
+                }
+            });
+        }
+        
+        return merged;
+    }
+    
+    private String substituteVariables(String template, Map<String, Object> variables) {
+        String result = template;
+        for (Map.Entry<String, Object> entry : variables.entrySet()) {
+            String placeholder = "{{" + entry.getKey() + "}}";
+            if (entry.getValue() != null) {
+                result = result.replace(placeholder, entry.getValue().toString());
+            }
+        }
+        return result;
+    }
+    
+    private String getTargetQueue(ChannelType channelType) {
+        return switch (channelType) {
+            case MOBILE_IOS, MOBILE_ANDROID -> "mobile-queue";
+            case WEB_PUSH -> "web-queue";
+            case EMAIL -> "email-queue";
+            case SMS -> "sms-queue";
+            case TEAMS -> "teams-queue";
+            case SLACK -> "slack-queue";
+            case IN_APP -> "in-app-queue";
+        };
+    }
+}
+
+// Supporting Classes
+@Data
+@Builder
+class RuleInputData {
+    private UserPreferences userPreferences;
+    private UserPresence userPresence;
+    private EmployeeData employeeData;
+}
+
+// Enhanced Routing Decision with Rule Execution Details
+@Data
+@Builder
+public class RoutingDecision {
+    private String notificationId;
+    private List<ChannelMessage> channelMessages;
+    private Instant timestamp;
+    private String correlationId;
+    private ZonedDateTime scheduledDeliveryTime;
+    private boolean isSmartNotification;
+    private RoutingStatus status;
+    private String message;
+    private Map<String, String> ruleExecutionSummary;
+}
+
+public enum RoutingStatus {
+    SUCCESS,
+    FAILED,
+    NO_ROUTES,
+    SCHEDULED,
+    RETRY_SCHEDULED,
+    ERROR
+}
+
+// Enhanced Rule Engine with Better Integration
+package com.notification.platform.routing.rules.engine;
+
+import com.notification.platform.routing.rules.core.*;
+import com.notification.platform.routing.domain.*;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
+import io.micrometer.core.instrument.Counter;
+import java.util.*;
+import java.time.ZonedDateTime;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class RuleEngine {
+    
+    private final RuleRegistry ruleRegistry;
+    private final MeterRegistry meterRegistry;
+    private final RuleAuditService auditService;
+    
+    public RuleEngineResult executeRules(RoutingContext routingContext,
+                                         Set<Route> initialRoutes,
+                                         UserPreferences userPreferences,
+                                         UserPresence userPresence,
+                                         EmployeeData employeeData) {
+        
+        String executionId = UUID.randomUUID().toString();
+        Timer.Sample sample = Timer.start(meterRegistry);
+        
+        try {
+            log.debug("Starting rule execution: {}", executionId);
+            
+            // Initialize context
+            RuleContext context = RuleContext.builder()
+                .routingContext(routingContext)
+                .currentRoutes(new ArrayList<>(initialRoutes))
+                .userPreferences(userPreferences)
+                .userPresence(userPresence)
+                .employeeData(employeeData)
+                .metadata(new HashMap<>())
+                .ruleCache(new HashMap<>())
+                .build();
+            
+            // Initialize tracking
+            List<RuleExecutionResult> executionResults = new ArrayList<>();
+            ZonedDateTime suggestedDeliveryTime = null;
+            int rulesExecuted = 0;
+            int rulesSkipped = 0;
+            
+            // Get active rules
+            List<RoutingRule> activeRules = ruleRegistry.getActiveRules();
+            log.info("Executing {} active rules for notification: {}", 
+                activeRules.size(), routingContext.getNotificationId());
+            
+            // Execute rules in order
+            for (RoutingRule rule : activeRules) {
+                Timer.Sample ruleSample = Timer.start(meterRegistry);
+                
+                try {
+                    // Check if rule should be skipped based on context
+                    if (shouldSkipRule(rule, context)) {
+                        log.debug("Skipping rule: {} (conditions not met)", rule.getRuleName());
+                        rulesSkipped++;
+                        continue;
+                    }
+                    
+                    log.debug("Executing rule: {} (order: {}, type: {})", 
+                        rule.getRuleName(), rule.getOrder(), rule.getRuleType());
+                    
+                    // Execute rule
+                    RuleResult result = rule.evaluate(context);
+                    rulesExecuted++;
+                    
+                    // Record execution
+                    RuleExecutionResult executionResult = RuleExecutionResult.builder()
+                        .ruleId(rule.getRuleId())
+                        .ruleName(rule.getRuleName())
+                        .ruleType(rule.getRuleType())
+                        .action(result.getAction())
+                        .reason(result.getReason())
+                        .routesBeforeCount(context.getCurrentRoutes().size())
+                        .routesAfterCount(result.getFilteredRoutes() != null ? 
+                            result.getFilteredRoutes().size() : context.getCurrentRoutes().size())
+                        .build();
+                    
+                    executionResults.add(executionResult);
+                    
+                    // Audit rule execution
+                    auditService.auditRuleExecution(executionId, rule, result);
+                    
+                    // Update context with results
+                    applyRuleResult(context, result);
+                    
+                    if (result.getSuggestedDeliveryTime() != null) {
+                        suggestedDeliveryTime = result.getSuggestedDeliveryTime();
+                    }
+                    
+                    // Increment metrics
+                    incrementRuleMetrics(rule, result);
+                    
+                    // Handle rule actions
+                    if (shouldStopProcessing(result)) {
+                        log.info("Rule {} stopped processing: {}", 
+                            rule.getRuleName(), result.getReason());
+                        break;
+                    }
+                    
+                } catch (Exception e) {
+                    log.error("Error executing rule: {}", rule.getRuleName(), e);
+                    handleRuleError(rule, e, executionResults);
+                    
+                } finally {
+                    ruleSample.stop(Timer.builder("rule.execution.time")
+                        .tag("rule", rule.getRuleId())
+                        .tag("type", rule.getRuleType().toString())
+                        .register(meterRegistry));
+                }
+            }
+            
+            // Build final result
+            boolean success = !hasFailure(executionResults);
+            
+            log.info("Rule execution completed: {} rules executed, {} skipped, success: {}", 
+                rulesExecuted, rulesSkipped, success);
+            
+            return RuleEngineResult.builder()
+                .executionId(executionId)
+                .filteredRoutes(context.getCurrentRoutes())
+                .metadata(context.getMetadata())
+                .executionResults(executionResults)
+                .success(success)
+                .suggestedDeliveryTime(suggestedDeliveryTime)
+                .rulesExecuted(rulesExecuted)
+                .rulesSkipped(rulesSkipped)
+                .build();
+            
+        } finally {
+            sample.stop(Timer.builder("rule.engine.total.time")
+                .tag("capability", routingContext.getCapability())
+                .tag("notification_type", routingContext.getPriority().toString())
+                .register(meterRegistry));
+        }
+    }
+    
+    private boolean shouldSkipRule(RoutingRule rule, RuleContext context) {
+        // Skip optimization rules if no routes left
+        if (rule.getRuleType() == RuleType.OPTIMIZATION && 
+            context.getCurrentRoutes().isEmpty()) {
+            return true;
+        }
+        
+        // Add more skip conditions as needed
+        return false;
+    }
+    
+    private void applyRuleResult(RuleContext context, RuleResult result) {
+        if (result.getFilteredRoutes() != null) {
+            context.setCurrentRoutes(result.getFilteredRoutes());
+        }
+        
+        if (result.getEnrichedData() != null) {
+            context.getMetadata().putAll(result.getEnrichedData());
+        }
+    }
+    
+    private boolean shouldStopProcessing(RuleResult result) {
+        return result.getAction() == RuleAction.STOP_SUCCESS ||
+               result.getAction() == RuleAction.STOP_FAILURE ||
+               !result.isShouldContinue();
+    }
+    
+    private boolean hasFailure(List<RuleExecutionResult> results) {
+        return results.stream()
+            .anyMatch(r -> r.getAction() == RuleAction.STOP_FAILURE);
+    }
+    
+    private void handleRuleError(RoutingRule rule, Exception e, 
+                                 List<RuleExecutionResult> executionResults) {
+        executionResults.add(RuleExecutionResult.builder()
+            .ruleId(rule.getRuleId())
+            .ruleName(rule.getRuleName())
+            .ruleType(rule.getRuleType())
+            .action(RuleAction.CONTINUE)
+            .reason("Error: " + e.getMessage())
+            .error(true)
+            .build());
+        
+        Counter.builder("rule.errors")
+            .tag("rule", rule.getRuleId())
+            .register(meterRegistry)
+            .increment();
+    }
+    
+    private void incrementRuleMetrics(RoutingRule rule, RuleResult result) {
+        Counter.builder("rule.executions")
+            .tag("rule", rule.getRuleId())
+            .tag("action", result.getAction().toString())
+            .register(meterRegistry)
+            .increment();
+    }
+}
+
+// Enhanced Rule Engine Result
+@Data
+@Builder
+public class RuleEngineResult {
+    private String executionId;
+    private List<Route> filteredRoutes;
+    private Map<String, Object> metadata;
+    private List<RuleExecutionResult> executionResults;
+    private boolean success;
+    private ZonedDateTime suggestedDeliveryTime;
+    private int rulesExecuted;
+    private int rulesSkipped;
+}
+
+@Data
+@Builder
+public class RuleExecutionResult {
+    private String ruleId;
+    private String ruleName;
+    private RuleType ruleType;
+    private RuleAction action;
+    private String reason;
+    private boolean error;
+    private int routesBeforeCount;
+    private int routesAfterCount;
+}
+
+// Rule Audit Service for Tracking
+package com.notification.platform.routing.rules.audit;
+
+import com.notification.platform.routing.rules.core.*;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.stereotype.Service;
+import lombok.RequiredArgsConstructor;
+import java.time.Instant;
+
+@Service
+@RequiredArgsConstructor
+public class RuleAuditService {
+    
+    private final MongoTemplate mongoTemplate;
+    
+    public void auditRuleExecution(String executionId, RoutingRule rule, RuleResult result) {
+        RuleAuditEntry entry = RuleAuditEntry.builder()
+            .executionId(executionId)
+            .ruleId(rule.getRuleId())
+            .ruleName(rule.getRuleName())
+            .ruleType(rule.getRuleType())
+            .action(result.getAction())
+            .reason(result.getReason())
+            .timestamp(Instant.now())
+            .build();
+        
+        mongoTemplate.save(entry, "rule_audit");
+    }
+}
+
+@Data
+@Builder
+class RuleAuditEntry {
+    private String executionId;
+    private String ruleId;
+    private String ruleName;
+    private RuleType ruleType;
+    private RuleAction action;
+    private String reason;
+    private Instant timestamp;
+}
+
+// Notification Scheduler for Delayed Delivery
+package com.notification.platform.routing.scheduler;
+
+import com.notification.platform.routing.domain.*;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import java.time.ZonedDateTime;
+import java.util.List;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class NotificationScheduler {
+    
+    private final MongoTemplate mongoTemplate;
+    private final EventBridgePublisher eventBridgePublisher;
+    
+    public void scheduleMessages(List<ChannelMessage> messages, ZonedDateTime scheduledTime) {
+        messages.forEach(message -> {
+            ScheduledMessage scheduled = ScheduledMessage.builder()
+                .message(message)
+                .scheduledTime(scheduledTime)
+                .status(ScheduleStatus.PENDING)
+                .createdAt(ZonedDateTime.now())
+                .build();
+            
+            mongoTemplate.save(scheduled, "scheduled_messages");
+            log.info("Scheduled message {} for {}", message.getMessageId(), scheduledTime);
+        });
+    }
+    
+    public void scheduleRetry(RoutingContext context, ZonedDateTime retryTime) {
+        RetryEntry retry = RetryEntry.builder()
+            .routingContext(context)
+            .retryTime(retryTime)
+            .retryCount(0)
+            .maxRetries(3)
+            .status(RetryStatus.PENDING)
+            .build();
+        
+        mongoTemplate.save(retry, "routing_retries");
+        log.info("Scheduled routing retry for {} at {}", context.getNotificationId(), retryTime);
+    }
+    
+    @Scheduled(fixedDelay = 30000) // Check every 30 seconds
+    public void processScheduledMessages() {
+        // Process scheduled messages
+        // Implementation details...
+    }
+}
+
+@Data
+@Builder
+class ScheduledMessage {
+    private ChannelMessage message;
+    private ZonedDateTime scheduledTime;
+    private ScheduleStatus status;
+    private ZonedDateTime createdAt;
+    private int retryCount;
+}
+
+@Data
+@Builder
+class RetryEntry {
+    private RoutingContext routingContext;
+    private ZonedDateTime retryTime;
+    private int retryCount;
+    private int maxRetries;
+    private RetryStatus status;
+}
+
+enum ScheduleStatus {
+    PENDING, PROCESSING, SENT, FAILED, CANCELLED
+}
+
+enum RetryStatus {
+    PENDING, RETRYING, SUCCESS, FAILED
+}
+
+// REST Controller for Rule Management
+package com.notification.platform.routing.controller;
+
+import com.notification.platform.routing.rules.core.*;
+import com.notification.platform.routing.rules.engine.*;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import java.util.*;
+import java.util.stream.Collectors;
+
+@Slf4j
+@RestController
+@RequestMapping("/api/v1/routing/rules")
+@RequiredArgsConstructor
+public class RuleManagementController {
+    
+    private final RuleRegistry ruleRegistry;
+    private final RuleConfigurationService ruleConfigService;
+    
+    @GetMapping
+    public ResponseEntity<List<RuleInfo>> getAllRules() {
+        List<RuleInfo> rules = ruleRegistry.getActiveRules().stream()
+            .map(this::toRuleInfo)
+            .collect(Collectors.toList());
+        
+        return ResponseEntity.ok(rules);
+    }
+    
+    @GetMapping("/{ruleId}")
+    public ResponseEntity<RuleInfo> getRule(@PathVariable String ruleId) {
+        RoutingRule rule = ruleRegistry.getRule(ruleId);
+        if (rule == null) {
+            return ResponseEntity.notFound().build();
+        }
+        return ResponseEntity.ok(toRuleInfo(rule));
+    }
+    
+    @PostMapping("/{ruleId}/enable")
+    public ResponseEntity<Void> enableRule(@PathVariable String ruleId) {
+        ruleConfigService.enableRule(ruleId);
+        ruleRegistry.reloadRules();
+        log.info("Enabled rule: {}", ruleId);
+        return ResponseEntity.ok().build();
+    }
+    
+    @PostMapping("/{ruleId}/disable")
+    public ResponseEntity<Void> disableRule(@PathVariable String ruleId) {
+        ruleConfigService.disableRule(ruleId);
+        ruleRegistry.reloadRules();
+        log.info("Disabled rule: {}", ruleId);
+        return ResponseEntity.ok().build();
+    }
+    
+    @PutMapping("/{ruleId}/order")
+    public ResponseEntity<Void> updateRuleOrder(
+            @PathVariable String ruleId,
+            @RequestParam int order) {
+        ruleConfigService.updateRuleOrder(ruleId, order);
+        ruleRegistry.reloadRules();
+        log.info("Updated rule {} order to {}", ruleId, order);
+        return ResponseEntity.ok().build();
+    }
+    
+    @PostMapping("/reload")
+    public ResponseEntity<Void> reloadRules() {
+        ruleRegistry.reloadRules();
+        log.info("Rules reloaded");
+        return ResponseEntity.ok().build();
+    }
+    
+    @GetMapping("/execution-stats")
+    public ResponseEntity<Map<String, RuleStats>> getRuleExecutionStats() {
+        Map<String, RuleStats> stats = ruleConfigService.getRuleExecutionStats();
+        return ResponseEntity.ok(stats);
+    }
+    
+    private RuleInfo toRuleInfo(RoutingRule rule) {
+        return RuleInfo.builder()
+            .ruleId(rule.getRuleId())
+            .ruleName(rule.getRuleName())
+            .ruleType(rule.getRuleType())
+            .order(rule.getOrder())
+            .enabled(rule.isEnabled())
+            .build();
+    }
+}
+
+@Data
+@Builder
+class RuleInfo {
+    private String ruleId;
+    private String ruleName;
+    private RuleType ruleType;
+    private int order;
+    private boolean enabled;
+}
+
+@Data
+@Builder
+class RuleStats {
+    private String ruleId;
+    private long executionCount;
+    private long successCount;
+    private long failureCount;
+    private double avgExecutionTime;
+    private Instant lastExecuted;
+}
+
+// Rule Configuration Service
+package com.notification.platform.routing.rules.config;
+
+import org.springframework.cloud.context.config.annotation.RefreshScope;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.stereotype.Service;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import java.util.*;
+
+@Slf4j
+@Service
+@RefreshScope
+@RequiredArgsConstructor
+public class RuleConfigurationService {
+    
+    private final RedisTemplate<String, Object> redisTemplate;
+    private static final String RULE_CONFIG_PREFIX = "rule:config:";
+    private static final String RULE_STATS_PREFIX = "rule:stats:";
+    
+    public void enableRule(String ruleId) {
+        String key = RULE_CONFIG_PREFIX + ruleId + ":enabled";
+        redisTemplate.opsForValue().set(key, true);
+    }
+    
+    public void disableRule(String ruleId) {
+        String key = RULE_CONFIG_PREFIX + ruleId + ":enabled";
+        redisTemplate.opsForValue().set(key, false);
+    }
+    
+    public void updateRuleOrder(String ruleId, int order) {
+        String key = RULE_CONFIG_PREFIX + ruleId + ":order";
+        redisTemplate.opsForValue().set(key, order);
+    }
+    
+    public boolean isRuleEnabled(String ruleId) {
+        String key = RULE_CONFIG_PREFIX + ruleId + ":enabled";
+        Boolean enabled = (Boolean) redisTemplate.opsForValue().get(key);
+        return enabled != null ? enabled : true; // Default to enabled
+    }
+    
+    public Integer getRuleOrder(String ruleId) {
+        String key = RULE_CONFIG_PREFIX + ruleId + ":order";
+        return (Integer) redisTemplate.opsForValue().get(key);
+    }
+    
+    public Map<String, RuleStats> getRuleExecutionStats() {
+        Map<String, RuleStats> stats = new HashMap<>();
+        Set<String> keys = redisTemplate.keys(RULE_STATS_PREFIX + "*");
+        
+        if (keys != null) {
+            for (String key : keys) {
+                String ruleId = key.replace(RULE_STATS_PREFIX, "");
+                RuleStats ruleStat = (RuleStats) redisTemplate.opsForValue().get(key);
+                if (ruleStat != null) {
+                    stats.put(ruleId, ruleStat);
+                }
+            }
+        }
+        
+        return stats;
+    }
+}
+
+// Testing Support for Rules
+package com.notification.platform.routing.rules.test;
+
+import com.notification.platform.routing.rules.core.*;
+import com.notification.platform.routing.domain.*;
+import org.springframework.stereotype.Component;
+import lombok.Builder;
+import lombok.Data;
+import java.util.*;
+
+@Component
+public class RuleTestFramework {
+    
+    public RuleTestResult testRule(RoutingRule rule, RuleTestScenario scenario) {
+        // Build test context
+        RuleContext context = buildTestContext(scenario);
+        
+        // Execute rule
+        long startTime = System.currentTimeMillis();
+        RuleResult result = rule.evaluate(context);
+        long executionTime = System.currentTimeMillis() - startTime;
+        
+        // Validate result
+        List<String> validationErrors = validateResult(result, scenario.getExpectedResult());
+        
+        return RuleTestResult.builder()
+            .ruleId(rule.getRuleId())
+            .scenario(scenario.getName())
+            .passed(validationErrors.isEmpty())
+            .executionTime(executionTime)
+            .actualResult(result)
+            .expectedResult(scenario.getExpectedResult())
+            .validationErrors(validationErrors)
+            .build();
+    }
+    
+    public List<RuleTestResult> testRuleWithScenarios(
+            RoutingRule rule, 
+            List<RuleTestScenario> scenarios) {
+        
+        return scenarios.stream()
+            .map(scenario -> testRule(rule, scenario))
+            .collect(Collectors.toList());
+    }
+    
+    private RuleContext buildTestContext(RuleTestScenario scenario) {
+        return RuleContext.builder()
+            .routingContext(scenario.getRoutingContext())
+            .currentRoutes(scenario.getInputRoutes())
+            .userPreferences(scenario.getUserPreferences())
+            .userPresence(scenario.getUserPresence())
+            .employeeData(scenario.getEmployeeData())
+            .metadata(new HashMap<>())
+            .ruleCache(new HashMap<>())
+            .build();
+    }
+    
+    private List<String> validateResult(RuleResult actual, RuleResult expected) {
+        List<String> errors = new ArrayList<>();
+        
+        if (actual.getAction() != expected.getAction()) {
+            errors.add("Action mismatch: expected " + expected.getAction() + 
+                      ", got " + actual.getAction());
+        }
+        
+        if (expected.getFilteredRoutes() != null) {
+            if (actual.getFilteredRoutes() == null) {
+                errors.add("Expected filtered routes but got null");
+            } else if (actual.getFilteredRoutes().size() != expected.getFilteredRoutes().size()) {
+                errors.add("Route count mismatch: expected " + 
+                          expected.getFilteredRoutes().size() + 
+                          ", got " + actual.getFilteredRoutes().size());
+            }
+        }
+        
+        return errors;
+    }
+}
+
+@Data
+@Builder
+class RuleTestScenario {
+    private String name;
+    private RoutingContext routingContext;
+    private List<Route> inputRoutes;
+    private UserPreferences userPreferences;
+    private UserPresence userPresence;
+    private EmployeeData employeeData;
+    private RuleResult expectedResult;
+}
+
+@Data
+@Builder
+class RuleTestResult {
+    private String ruleId;
+    private String scenario;
+    private boolean passed;
+    private long executionTime;
+    private RuleResult actualResult;
+    private RuleResult expectedResult;
+    private List<String> validationErrors;
+}
+
+// Health Check for Rules
+package com.notification.platform.routing.health;
+
+import com.notification.platform.routing.rules.core.*;
+import org.springframework.boot.actuator.health.Health;
+import org.springframework.boot.actuator.health.HealthIndicator;
+import org.springframework.stereotype.Component;
+import lombok.RequiredArgsConstructor;
+
+@Component
+@RequiredArgsConstructor
+public class RuleEngineHealthIndicator implements HealthIndicator {
+    
+    private final RuleRegistry ruleRegistry;
+    
+    @Override
+    public Health health() {
+        try {
+            List<RoutingRule> activeRules = ruleRegistry.getActiveRules();
+            
+            if (activeRules.isEmpty()) {
+                return Health.down()
+                    .withDetail("message", "No active rules found")
+                    .build();
+            }
+            
+            Map<String, Integer> rulesByType = new HashMap<>();
+            for (RoutingRule rule : activeRules) {
+                rulesByType.merge(rule.getRuleType().toString(), 1, Integer::sum);
+            }
+            
+            return Health.up()
+                .withDetail("totalActiveRules", activeRules.size())
+                .withDetail("rulesByType", rulesByType)
+                .build();
+                
+        } catch (Exception e) {
+            return Health.down()
+                .withDetail("error", e.getMessage())
+                .build();
+        }
+    }
+}
+
+// Configuration Properties for Rules
+package com.notification.platform.routing.config;
+
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.stereotype.Component;
+import lombok.Data;
+import java.util.Map;
+
+@Data
+@Component
+@ConfigurationProperties(prefix = "routing.rules")
+public class RuleConfigurationProperties {
+    
+    private Map<String, RuleConfig> rules;
+    private GlobalRuleConfig global;
+    
+    @Data
+    public static class RuleConfig {
+        private boolean enabled = true;
+        private int order;
+        private Map<String, Object> parameters;
+    }
+    
+    @Data
+    public static class GlobalRuleConfig {
+        private boolean enableAudit = true;
+        private boolean enableMetrics = true;
+        private int maxExecutionTimeMs = 5000;
+        private boolean failOnError = false;
+    }
+}
+
+// Complete application.yml configuration
+```yaml
+spring:
+  application:
+    name: routing-service
+  
+  data:
+    mongodb:
+      uri: ${MONGODB_URI:mongodb://localhost:27017/routing}
+  
+  redis:
+    host: ${REDIS_HOST:localhost}
+    port: ${REDIS_PORT:6379}
+  
+  cache:
+    type: caffeine
+
+aws:
+  region: ${AWS_REGION:us-east-1}
+  sqs:
+    routing-queue-url: ${ROUTING_QUEUE_URL}
+  eventbridge:
+    bus-name: ${EVENT_BUS_NAME:notification-bus}
+
+external:
+  services:
+    user-presence:
+      url: ${USER_PRESENCE_SERVICE_URL}
+    employee-data:
+      url: ${EMPLOYEE_DATA_SERVICE_URL}
+    bff:
+      url: ${BFF_SERVICE_URL}
+
+routing:
+  rules:
+    global:
+      enable-audit: true
+      enable-metrics: true
+      max-execution-time-ms: 5000
+      fail-on-error: false
+    
+    # Core Rules
+    capability-validation:
+      enabled: true
+      order: 50
+      
+    user-opt-out:
+      enabled: true
+      order: 100
+    
+    rate-limiting:
+      enabled: true
+      order: 150
+      parameters:
+        requests-per-hour: 100
+        requests-per-day: 500
+    
+    channel-enabled:
+      enabled: true
+      order: 200
+    
+    geolocation:
+      enabled: false
+      order: 250
+    
+    quiet-hours:
+      enabled: true
+      order: 300
+    
+    daily-limit:
+      enabled: true
+      order: 350
+    
+    user-presence:
+      enabled: true
+      order: 400
+    
+    ab-testing:
+      enabled: false
+      order: 450
+    
+    smart-scheduling:
+      enabled: true
+      order: 500
+    
+    template-personalization:
+      enabled: true
+      order: 600
+    
+    deep-link-enrichment:
+      enabled: true
+      order: 650
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  health:
+    components:
+      rule-engine:
+        enabled: true
+```
