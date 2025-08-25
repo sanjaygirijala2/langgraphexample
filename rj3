@@ -1,0 +1,651 @@
+// ==================== RATE LIMITING FILTER ====================
+package com.notification.platform.router.filter.impl;
+
+import com.google.common.util.concurrent.RateLimiter;
+import com.notification.platform.router.domain.RoutingContext;
+import com.notification.platform.router.filter.RoutingFilter;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+
+@Slf4j
+@Component
+public class RateLimitFilter implements RoutingFilter {
+    
+    private final Map<String, RateLimiter> userRateLimiters = new ConcurrentHashMap<>();
+    private final Map<String, RateLimiter> routeRateLimiters = new ConcurrentHashMap<>();
+    
+    @Value("${notification.rate-limit.per-user:10}")
+    private int perUserLimit;
+    
+    @Value("${notification.rate-limit.per-route:100}")
+    private int perRouteLimit;
+    
+    @Value("${notification.rate-limit.enabled:true}")
+    private boolean enabled;
+    
+    @Override
+    public boolean shouldProcess(RoutingContext context) {
+        return enabled && context != null;
+    }
+    
+    @Override
+    public RoutingContext process(RoutingContext context) {
+        // Per-user rate limiting
+        String userId = context.getRecipientId();
+        RateLimiter userLimiter = userRateLimiters.computeIfAbsent(userId, 
+            k -> RateLimiter.create(perUserLimit));
+        
+        if (!userLimiter.tryAcquire(100, TimeUnit.MILLISECONDS)) {
+            log.warn("Rate limit exceeded for user: {}", userId);
+            context.getMetadata().put("rateLimited", true);
+            context.getMetadata().put("rateLimitReason", "USER_LIMIT_EXCEEDED");
+            return null;
+        }
+        
+        // Per-route rate limiting
+        for (String route : context.getRoutes()) {
+            RateLimiter routeLimiter = routeRateLimiters.computeIfAbsent(route,
+                k -> RateLimiter.create(perRouteLimit));
+            
+            if (!routeLimiter.tryAcquire(50, TimeUnit.MILLISECONDS)) {
+                log.warn("Rate limit exceeded for route: {}", route);
+                context.getRoutes().remove(route);
+            }
+        }
+        
+        return context;
+    }
+    
+    @Override
+    public int getOrder() {
+        return 5; // Execute early to prevent unnecessary processing
+    }
+    
+    @Override
+    public String getName() {
+        return "RateLimitFilter";
+    }
+}
+
+// ==================== A/B TESTING FILTER ====================
+package com.notification.platform.router.filter.impl;
+
+import com.notification.platform.router.domain.RoutingContext;
+import com.notification.platform.router.filter.RoutingFilter;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Random;
+
+@Slf4j
+@Component
+public class ABTestingFilter implements RoutingFilter {
+    
+    private final Random random = new Random();
+    private final Map<String, ABTestConfig> activeTests = new HashMap<>();
+    
+    public ABTestingFilter() {
+        // Initialize with some test configurations
+        // In production, this would be loaded from database/config
+        activeTests.put("EMAIL_SUBJECT_TEST", new ABTestConfig(
+            "email_subject_v1", "email_subject_v2", 0.5
+        ));
+    }
+    
+    @Override
+    public boolean shouldProcess(RoutingContext context) {
+        return context != null && !activeTests.isEmpty();
+    }
+    
+    @Override
+    public RoutingContext process(RoutingContext context) {
+        for (Map.Entry<String, ABTestConfig> entry : activeTests.entrySet()) {
+            String testName = entry.getKey();
+            ABTestConfig config = entry.getValue();
+            
+            // Determine variant based on random split
+            String variant = random.nextDouble() < config.splitRatio ? 
+                config.variantA : config.variantB;
+            
+            // Add test metadata
+            context.getMetadata().put("abTest_" + testName, variant);
+            
+            // Modify template or content based on variant
+            if (testName.contains("SUBJECT") && variant.equals(config.variantB)) {
+                // Example: Use alternative subject template
+                context.getMetadata().put("alternativeTemplate", true);
+            }
+        }
+        
+        return context;
+    }
+    
+    @Override
+    public int getOrder() {
+        return 40;
+    }
+    
+    @Override
+    public String getName() {
+        return "ABTestingFilter";
+    }
+    
+    private static class ABTestConfig {
+        String variantA;
+        String variantB;
+        double splitRatio;
+        
+        ABTestConfig(String variantA, String variantB, double splitRatio) {
+            this.variantA = variantA;
+            this.variantB = variantB;
+            this.splitRatio = splitRatio;
+        }
+    }
+}
+
+// ==================== DEDUPLICATION FILTER ====================
+package com.notification.platform.router.filter.impl;
+
+import com.notification.platform.router.domain.RoutingContext;
+import com.notification.platform.router.filter.RoutingFilter;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.stereotype.Component;
+import java.util.concurrent.TimeUnit;
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class DeduplicationFilter implements RoutingFilter {
+    
+    private final RedisTemplate<String, String> redisTemplate;
+    
+    @Value("${notification.dedup.enabled:true}")
+    private boolean enabled;
+    
+    @Value("${notification.dedup.window-minutes:60}")
+    private int dedupWindowMinutes;
+    
+    @Override
+    public boolean shouldProcess(RoutingContext context) {
+        return enabled && context != null;
+    }
+    
+    @Override
+    public RoutingContext process(RoutingContext context) {
+        String dedupKey = buildDedupKey(context);
+        
+        // Check if notification was recently sent
+        Boolean wasSet = redisTemplate.opsForValue()
+            .setIfAbsent(dedupKey, context.getNotificationId(), 
+                dedupWindowMinutes, TimeUnit.MINUTES);
+        
+        if (Boolean.FALSE.equals(wasSet)) {
+            log.info("Duplicate notification detected for key: {}", dedupKey);
+            context.getMetadata().put("duplicate", true);
+            return null; // Skip duplicate
+        }
+        
+        return context;
+    }
+    
+    private String buildDedupKey(RoutingContext context) {
+        return String.format("dedup:%s:%s:%s",
+            context.getCapabilityName(),
+            context.getRecipientId(),
+            context.getPersonalizedContent().hashCode());
+    }
+    
+    @Override
+    public int getOrder() {
+        return 15;
+    }
+    
+    @Override
+    public String getName() {
+        return "DeduplicationFilter";
+    }
+}
+
+// ==================== FREQUENCY CAP FILTER ====================
+package com.notification.platform.router.filter.impl;
+
+import com.notification.platform.router.domain.RoutingContext;
+import com.notification.platform.router.filter.RoutingFilter;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.query.Criteria;
+import org.springframework.data.mongodb.core.query.Query;
+import org.springframework.stereotype.Component;
+import java.time.LocalDateTime;
+import java.util.HashMap;
+import java.util.Map;
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class FrequencyCapFilter implements RoutingFilter {
+    
+    private final MongoTemplate mongoTemplate;
+    
+    // Capability to frequency limits (per day)
+    private static final Map<String, Integer> FREQUENCY_CAPS = new HashMap<>() {{
+        put("MARKETING", 2);
+        put("PROMOTIONAL", 3);
+        put("TRANSACTIONAL", 100); // High limit for transactional
+        put("SYSTEM", 50);
+    }};
+    
+    @Override
+    public boolean shouldProcess(RoutingContext context) {
+        return context != null && FREQUENCY_CAPS.containsKey(context.getCapabilityName());
+    }
+    
+    @Override
+    public RoutingContext process(RoutingContext context) {
+        String capability = context.getCapabilityName();
+        Integer cap = FREQUENCY_CAPS.get(capability);
+        
+        if (cap == null) {
+            return context;
+        }
+        
+        // Count notifications sent today for this capability and user
+        LocalDateTime startOfDay = LocalDateTime.now().withHour(0).withMinute(0).withSecond(0);
+        
+        Query query = new Query(Criteria.where("recipientId").is(context.getRecipientId())
+            .and("capabilityName").is(capability)
+            .and("sentAt").gte(startOfDay));
+        
+        long count = mongoTemplate.count(query, "notification_history");
+        
+        if (count >= cap) {
+            log.info("Frequency cap reached for user {} and capability {}: {}/{}", 
+                context.getRecipientId(), capability, count, cap);
+            context.getMetadata().put("frequencyCapped", true);
+            context.getMetadata().put("capLimit", cap);
+            context.getMetadata().put("currentCount", count);
+            return null;
+        }
+        
+        context.getMetadata().put("frequencyCount", count);
+        return context;
+    }
+    
+    @Override
+    public int getOrder() {
+        return 25;
+    }
+    
+    @Override
+    public String getName() {
+        return "FrequencyCapFilter";
+    }
+}
+
+// ==================== CONTENT ENRICHMENT FILTER ====================
+package com.notification.platform.router.filter.impl;
+
+import com.notification.platform.router.domain.RoutingContext;
+import com.notification.platform.router.filter.RoutingFilter;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+import java.util.Map;
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class ContentEnrichmentFilter implements RoutingFilter {
+    
+    private final ExternalDataService externalDataService;
+    
+    @Override
+    public boolean shouldProcess(RoutingContext context) {
+        return context != null && 
+               context.getMetadata().containsKey("requiresEnrichment");
+    }
+    
+    @Override
+    public RoutingContext process(RoutingContext context) {
+        try {
+            // Enrich content with external data
+            Map<String, Object> enrichedData = externalDataService
+                .fetchEnrichmentData(context.getRecipientId());
+            
+            if (enrichedData != null) {
+                context.getPersonalizedContent().putAll(enrichedData);
+                context.getMetadata().put("enriched", true);
+            }
+            
+        } catch (Exception e) {
+            log.error("Error enriching content for user: {}", context.getRecipientId(), e);
+            // Continue without enrichment
+        }
+        
+        return context;
+    }
+    
+    @Override
+    public int getOrder() {
+        return 35;
+    }
+    
+    @Override
+    public String getName() {
+        return "ContentEnrichmentFilter";
+    }
+}
+
+// ==================== PRIORITY ROUTING FILTER ====================
+package com.notification.platform.router.filter.impl;
+
+import com.notification.platform.router.domain.RoutingContext;
+import com.notification.platform.router.filter.RoutingFilter;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+import java.util.ArrayList;
+import java.util.List;
+
+@Slf4j
+@Component
+public class PriorityRoutingFilter implements RoutingFilter {
+    
+    @Override
+    public boolean shouldProcess(RoutingContext context) {
+        return context != null && context.getMetadata().containsKey("priority");
+    }
+    
+    @Override
+    public RoutingContext process(RoutingContext context) {
+        Integer priority = (Integer) context.getMetadata().get("priority");
+        
+        if (priority == null) {
+            return context;
+        }
+        
+        // High priority notifications get all routes
+        // Medium priority skips certain channels
+        // Low priority only uses essential channels
+        List<String> filteredRoutes = new ArrayList<>();
+        
+        for (String route : context.getRoutes()) {
+            if (shouldIncludeRoute(route, priority)) {
+                filteredRoutes.add(route);
+            }
+        }
+        
+        context.setRoutes(filteredRoutes);
+        
+        // Add priority queue hint for downstream processing
+        if (priority >= 4) {
+            context.getMetadata().put("queuePriority", "HIGH");
+        } else if (priority >= 2) {
+            context.getMetadata().put("queuePriority", "NORMAL");
+        } else {
+            context.getMetadata().put("queuePriority", "LOW");
+        }
+        
+        return context;
+    }
+    
+    private boolean shouldIncludeRoute(String route, int priority) {
+        // High priority (4-5): All routes
+        if (priority >= 4) {
+            return true;
+        }
+        
+        // Medium priority (2-3): Skip expensive routes like SMS
+        if (priority >= 2) {
+            return !route.equals("SMS");
+        }
+        
+        // Low priority (0-1): Only email and in-app
+        return route.equals("EMAIL") || route.equals("WEB");
+    }
+    
+    @Override
+    public int getOrder() {
+        return 45;
+    }
+    
+    @Override
+    public String getName() {
+        return "PriorityRoutingFilter";
+    }
+}
+
+// ==================== GEOGRAPHIC FILTER ====================
+package com.notification.platform.router.filter.impl;
+
+import com.notification.platform.router.domain.RoutingContext;
+import com.notification.platform.router.filter.RoutingFilter;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+import java.util.Map;
+import java.util.Set;
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class GeographicFilter implements RoutingFilter {
+    
+    private final GeolocationService geolocationService;
+    
+    // Routes available by region
+    private static final Map<String, Set<String>> REGIONAL_ROUTES = Map.of(
+        "EU", Set.of("EMAIL", "WEB", "MOBILE_IOS", "MOBILE_ANDROID"),
+        "US", Set.of("EMAIL", "WEB", "SMS", "MOBILE_IOS", "MOBILE_ANDROID", "TEAMS"),
+        "ASIA", Set.of("EMAIL", "WEB", "MOBILE_IOS", "MOBILE_ANDROID", "WECHAT"),
+        "DEFAULT", Set.of("EMAIL", "WEB")
+    );
+    
+    @Override
+    public boolean shouldProcess(RoutingContext context) {
+        return context != null;
+    }
+    
+    @Override
+    public RoutingContext process(RoutingContext context) {
+        try {
+            String userRegion = geolocationService.getUserRegion(context.getRecipientId());
+            
+            if (userRegion == null) {
+                userRegion = "DEFAULT";
+            }
+            
+            Set<String> allowedRoutes = REGIONAL_ROUTES.getOrDefault(userRegion, 
+                REGIONAL_ROUTES.get("DEFAULT"));
+            
+            // Filter routes based on region
+            context.getRoutes().retainAll(allowedRoutes);
+            
+            // Add region metadata for template localization
+            context.getMetadata().put("userRegion", userRegion);
+            
+            // Add compliance flags
+            if ("EU".equals(userRegion)) {
+                context.getMetadata().put("gdprCompliance", true);
+            }
+            
+        } catch (Exception e) {
+            log.error("Error in geographic filter", e);
+        }
+        
+        return context;
+    }
+    
+    @Override
+    public int getOrder() {
+        return 50;
+    }
+    
+    @Override
+    public String getName() {
+        return "GeographicFilter";
+    }
+}
+
+// ==================== SUPPORTING SERVICES ====================
+package com.notification.platform.router.service;
+
+import org.springframework.stereotype.Service;
+import java.util.HashMap;
+import java.util.Map;
+
+@Service
+public class ExternalDataService {
+    
+    public Map<String, Object> fetchEnrichmentData(String userId) {
+        // Simulate fetching additional data from external systems
+        Map<String, Object> data = new HashMap<>();
+        
+        // This would typically call external APIs or databases
+        data.put("accountType", "PREMIUM");
+        data.put("memberSince", "2020-01-15");
+        data.put("loyaltyPoints", 1500);
+        
+        return data;
+    }
+}
+
+@Service
+public class GeolocationService {
+    
+    public String getUserRegion(String userId) {
+        // Simulate geolocation lookup
+        // In production, this would query a geolocation service or user profile
+        
+        // Simple hash-based simulation for demo
+        int hash = userId.hashCode();
+        if (hash % 3 == 0) return "US";
+        if (hash % 3 == 1) return "EU";
+        return "ASIA";
+    }
+}
+
+// ==================== CUSTOM FILTER TEMPLATE ====================
+package com.notification.platform.router.filter.custom;
+
+import com.notification.platform.router.domain.RoutingContext;
+import com.notification.platform.router.filter.RoutingFilter;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+
+/**
+ * Template for creating custom filters.
+ * To create a new filter:
+ * 1. Copy this template
+ * 2. Implement the shouldProcess() logic
+ * 3. Implement the process() logic
+ * 4. Set appropriate order (lower numbers execute first)
+ * 5. The filter will be automatically registered via Spring component scan
+ */
+@Slf4j
+@Component
+public class CustomFilterTemplate implements RoutingFilter {
+    
+    @Override
+    public boolean shouldProcess(RoutingContext context) {
+        // Define when this filter should be applied
+        // Example: return context != null && context.getMetadata().containsKey("customFlag");
+        return false; // Disabled by default
+    }
+    
+    @Override
+    public RoutingContext process(RoutingContext context) {
+        // Implement your custom logic here
+        log.debug("Processing custom filter for notification: {}", context.getNotificationId());
+        
+        // Example: Modify routes based on custom logic
+        // context.getRoutes().add("CUSTOM_CHANNEL");
+        
+        // Example: Add metadata
+        // context.getMetadata().put("customProcessed", true);
+        
+        // Example: Filter out notification (return null to stop processing)
+        // if (someCondition) {
+        //     return null;
+        // }
+        
+        return context;
+    }
+    
+    @Override
+    public int getOrder() {
+        // Set execution order (0-100 typically)
+        // Common order ranges:
+        // 0-10: Validation and early filters
+        // 10-30: User preference and device filters
+        // 30-50: Content and routing filters
+        // 50-70: Enhancement filters
+        // 70-100: Final filters
+        return 100;
+    }
+    
+    @Override
+    public String getName() {
+        return "CustomFilterTemplate";
+    }
+}
+
+// ==================== FILTER REGISTRY FOR DYNAMIC LOADING ====================
+package com.notification.platform.router.filter;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+import javax.annotation.PostConstruct;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+@Slf4j
+@Component
+public class FilterRegistry {
+    
+    private final Map<String, RoutingFilter> filterMap = new ConcurrentHashMap<>();
+    private final List<RoutingFilter> filters;
+    
+    public FilterRegistry(List<RoutingFilter> filters) {
+        this.filters = filters;
+    }
+    
+    @PostConstruct
+    public void init() {
+        for (RoutingFilter filter : filters) {
+            filterMap.put(filter.getName(), filter);
+            log.info("Registered filter: {} with order: {}", filter.getName(), filter.getOrder());
+        }
+    }
+    
+    public void registerFilter(RoutingFilter filter) {
+        filterMap.put(filter.getName(), filter);
+        filters.add(filter);
+        log.info("Dynamically registered filter: {}", filter.getName());
+    }
+    
+    public void unregisterFilter(String filterName) {
+        RoutingFilter removed = filterMap.remove(filterName);
+        if (removed != null) {
+            filters.remove(removed);
+            log.info("Unregistered filter: {}", filterName);
+        }
+    }
+    
+    public RoutingFilter getFilter(String name) {
+        return filterMap.get(name);
+    }
+    
+    public Map<String, RoutingFilter> getAllFilters() {
+        return new ConcurrentHashMap<>(filterMap);
+    }
+}
